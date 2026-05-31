@@ -123,6 +123,68 @@ static void skip_value(u32 type, u8 **p) {
     }
 }
 
+static int load_tokenizer_from_gguf(GGUFContext *ctx) {
+    u8 *p = ctx->base;
+    u64 meta_count;
+    u64 i;
+    if (memcmp(p, "GGUF", 4) != 0) return 0;
+    p += 4;
+    read_u32(&p); /* version */
+    read_u64(&p); /* tensor_count */
+    meta_count = read_u64(&p);
+    for (i = 0; i < meta_count; i++) {
+        u64 keylen = read_u64(&p);
+        char key[256];
+        u32 vtype;
+        u64 len;
+        u32 atype;
+        u8 *start_of_value;
+        if (keylen > 255) keylen = 255;
+        memcpy(key, p, (size_t)keylen); key[keylen] = '\0'; p += keylen;
+        vtype = read_u32(&p);
+        start_of_value = p;
+        if (strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == 9) {
+            atype = read_u32(&p);
+            len = read_u64(&p);
+            if (atype == 8 && len > 0 && len < 1000000) {
+                u64 tok_buf_size = 0;
+                u8 *save_p = p;
+                u64 k;
+                for (k = 0; k < len; k++) {
+                    u64 slen = read_u64(&save_p);
+                    tok_buf_size += 1 + slen;
+                    save_p += slen;
+                }
+                g_vocab = (TokenEntry*)malloc(sizeof(TokenEntry) * (size_t)len);
+                g_tok_buf = (u8*)malloc((size_t)tok_buf_size);
+                if (!g_vocab || !g_tok_buf) {
+                    free(g_vocab); g_vocab = NULL;
+                    free(g_tok_buf); g_tok_buf = NULL;
+                    return 0;
+                }
+                g_vocab_n = (int)len;
+                tok_buf_size = 0;
+                for (k = 0; k < len; k++) {
+                    u64 slen = read_u64(&p);
+                    g_vocab[k].len = (int)slen;
+                    g_vocab[k].text = (char*)(g_tok_buf + tok_buf_size);
+                    memcpy(g_tok_buf + tok_buf_size, p, (size_t)slen);
+                    tok_buf_size += slen;
+                    g_tok_buf[tok_buf_size] = '\0';
+                    tok_buf_size++;
+                    p += slen;
+                }
+                printf("Loaded tokenizer from GGUF: %d tokens\n", g_vocab_n);
+                return 1;
+            }
+        } else {
+            skip_value(vtype, &p);
+        }
+        (void)start_of_value;
+    }
+    return 0;
+}
+
 static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
     u64 i;
     u32 vtype;
@@ -368,26 +430,58 @@ static float silu(float x) {
     return x * fast_sigmoid(x);
 }
 
-static int sample(float *probs, int n, float temp) {
-    int i;
-    int best;
-    float r, cdf;
-    float maxv;
+/* llama.cpp-style top-k + temperature sampling */
+static int sample_topk(float *logits, int n, float temp, int top_k) {
+    int i, k;
+    float maxv, sum, r, cdf;
+    /* Find top-k threshold: k-th largest value */
+    if (top_k > 0 && top_k < n) {
+        for (k = 0; k < top_k; k++) {
+            int best_idx = -1;
+            float best_val = -1e30f;
+            for (i = 0; i < n; i++) {
+                if (logits[i] > best_val) {
+                    best_val = logits[i];
+                    best_idx = i;
+                }
+            }
+            /* Mark as kept by negating (we restore later) */
+            if (best_idx >= 0) logits[best_idx] = -logits[best_idx];
+        }
+        /* Zero out everything below top-k, restore kept values */
+        for (i = 0; i < n; i++) {
+            if (logits[i] > 0.0f || logits[i] == 0.0f) {
+                logits[i] = -1e30f; /* was NOT selected, zero out */
+            } else {
+                logits[i] = -logits[i]; /* restore original value */
+            }
+        }
+    }
+    /* Greedy (temp = 0) */
     if (temp == 0.0f) {
-        best = 0;
-        for (i = 1; i < n; i++) if (probs[i] > probs[best]) best = i;
+        int best = 0;
+        for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
-    for (i = 0; i < n; i++) probs[i] /= temp;
-    maxv = probs[0];
-    for (i = 1; i < n; i++) if (probs[i] > maxv) maxv = probs[i];
-    cdf = 0.0f;
-    for (i = 0; i < n; i++) { probs[i] = fast_exp_table(probs[i] - maxv); cdf += probs[i]; }
-    for (i = 0; i < n; i++) probs[i] /= cdf;
+    /* Temperature scaling + softmax */
+    for (i = 0; i < n; i++) logits[i] /= temp;
+    maxv = logits[0];
+    for (i = 1; i < n; i++) if (logits[i] > maxv) maxv = logits[i];
+    sum = 0.0f;
+    for (i = 0; i < n; i++) {
+        if (logits[i] > -1e20f) {
+            logits[i] = fast_exp_table(logits[i] - maxv);
+            sum += logits[i];
+        } else {
+            logits[i] = 0.0f;
+        }
+    }
+    for (i = 0; i < n; i++) logits[i] /= sum;
+    /* Sample from distribution */
     r = (float)rand() / (float)RAND_MAX;
     cdf = 0.0f;
     for (i = 0; i < n; i++) {
-        cdf += probs[i];
+        cdf += logits[i];
         if (r < cdf) return i;
     }
     return n - 1;
@@ -492,9 +586,11 @@ static float fp16_to_fp32(u16 h) {
     { float fv; memcpy(&fv, &f, 4); return fv; }
 }
 
+#pragma pack(push, 1)
 typedef struct { u16 d[2]; u8 scales[12]; u8 qs[128]; } BlockQ4K;
 typedef struct { u16 d[2]; u8 scales[12]; u8 qh[32]; u8 qs[128]; } BlockQ5K;
 typedef struct { u8 ql[128]; u8 qh[64]; s8 scales[16]; u16 d; } BlockQ6K;
+#pragma pack(pop)
 
 static void get_scale_min_k4(int j, const u8 *q, u8 *d, u8 *m) {
     if (j < 4) {
@@ -1067,6 +1163,25 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
     }
 
+    /* Diagnostics: verify block sizes and tensor offsets */
+    printf("Block sizes: Q4=%u(exp144) Q5=%u(exp176) Q6=%u(exp210)\n",
+           (unsigned int)sizeof(BlockQ4K),
+           (unsigned int)sizeof(BlockQ5K),
+           (unsigned int)sizeof(BlockQ6K));
+    printf("tok_embd: dims=[%u,%u] type=%u transposed=%d\n",
+           (unsigned int)m->tok_embd->dims[0],
+           (unsigned int)m->tok_embd->dims[1],
+           (unsigned int)m->tok_embd->type,
+           m->tok_embd_transposed);
+    for (i = 0; i < (int)ctx->n_tensors && i < 5; i++) {
+        printf("Tensor[%d]: %s offset=%u\n", i,
+               ctx->tensors[i].name,
+               (unsigned int)(ctx->tensors[i].offset & 0xFFFFFFFFUL));
+    }
+    printf("data_offset=%u file_size=%u\n",
+           (unsigned int)(ctx->data_offset & 0xFFFFFFFFUL),
+           (unsigned int)(ctx->size & 0xFFFFFFFFUL));
+
     printf("Model: dim=%d layers=%d heads=%d kv_heads=%d hidden=%d vocab=%d seq=%d\n",
            m->dim, m->n_layers, m->n_heads, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len);
     return 0;
@@ -1154,7 +1269,7 @@ static void free_runstate(RunState *s) {
 
 /* --- Forward pass --- */
 
-static int forward(Model *m, RunState *s, int token, int pos, float temp) {
+static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, int *recent, int recent_n) {
     int dim = m->dim;
     int hidden_dim = m->hidden_dim;
     int n_layers = m->n_layers;
@@ -1188,8 +1303,6 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp) {
         dequantize_row(m->tok_embd, x, token, dim);
     }
 
-    printf("[tok %d] ", pos);
-    fflush(stdout);
     for (l = 0; l < n_layers; l++) {
         /* Attention */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
@@ -1269,7 +1382,6 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp) {
 
         matvec(m->ffn_down[l], s->ffn_hidden, x, dim, hidden_dim, s->dq_row);
         for (i = 0; i < dim; i++) x[i] += tmp[i];
-        if (l % 5 == 4) { printf("."); fflush(stdout); }
     }
 
     rmsnorm(x, (float*)m->output_norm->data, dim, m->norm_eps);
@@ -1279,7 +1391,19 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp) {
     } else {
         matvec(m->output, x, s->logits, vocab_size, dim, s->dq_row);
     }
-    return sample(s->logits, vocab_size, temp);
+    /* Repetition penalty: discourage recent tokens */
+    if (recent && recent_n > 0) {
+        float penalty = 1.15f;
+        int j;
+        for (j = 0; j < recent_n && j < 32; j++) {
+            int tok = recent[j];
+            if (tok > 0 && tok < vocab_size) {
+                if (s->logits[tok] > 0.0f) s->logits[tok] /= penalty;
+                else s->logits[tok] *= penalty;
+            }
+        }
+    }
+    return sample_topk(s->logits, vocab_size, temp, top_k);
 }
 
 /* --- Tokenizer --- */
@@ -1340,13 +1464,40 @@ static int tokenize(const char *text, int *tokens, int max_tokens, int vocab_siz
     return n;
 }
 
-static void detokenize(int token) {
+static void detokenize(int token, int vocab_size) {
+    /* Only skip padding token 0. Print everything else including EOS/BOS. */
+    if (token == 0) return;
     if (g_vocab && token >= 0 && token < g_vocab_n && g_vocab[token].len > 0) {
         fwrite(g_vocab[token].text, 1, g_vocab[token].len, stdout);
     } else {
         if (token >= 32 && token < 127) printf("%c", (char)token);
-        else printf("<%d>", token);
     }
+}
+
+static int find_special_token(const char *name) {
+    int i;
+    int namelen = (int)strlen(name);
+    if (!g_vocab) return -1;
+    for (i = 0; i < g_vocab_n; i++) {
+        if (g_vocab[i].len == namelen && memcmp(g_vocab[i].text, name, namelen) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void scan_special_tokens(void) {
+    int ids[8];
+    const char *names[8] = {
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<s>", "</s>",
+        "<|user|>", "<|assistant|>", "\n"
+    };
+    int i;
+    printf("Special tokens: ");
+    for (i = 0; i < 8; i++) {
+        ids[i] = find_special_token(names[i]);
+        if (ids[i] >= 0) printf("%s=%d ", names[i], ids[i]);
+    }
+    printf("\n");
 }
 
 /* --- Main --- */
@@ -1366,6 +1517,9 @@ int main(int argc, char **argv) {
     int n_kv_user = 0;
     int hidden_user = 0;
     int seq_user = 0;
+    int top_k = 40;
+    int eos_token = 2;
+    int do_chat = 0;
     int do_list = 0;
     int arg;
     int pos;
@@ -1387,6 +1541,9 @@ int main(int argc, char **argv) {
         printf("  --n_kv <n>      Override KV head count\n");
         printf("  --hidden <n>    Override hidden dim\n");
         printf("  --seq <n>       Override max sequence length\n");
+        printf("  --top-k <n>     Top-k sampling, 0=disabled (default 40)\n");
+        printf("  --eos <id>      EOS token ID (default 2 for SmoLLM2)\n");
+        printf("  --chat          Wrap prompt in chat template\n");
         return 1;
     }
 
@@ -1401,12 +1558,16 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--n_kv") == 0 && arg + 1 < argc) { n_kv_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--hidden") == 0 && arg + 1 < argc) { hidden_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--seq") == 0 && arg + 1 < argc) { seq_user = atoi(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "--top-k") == 0 && arg + 1 < argc) { top_k = atoi(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "--eos") == 0 && arg + 1 < argc) { eos_token = atoi(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
         else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
     }
 
     if (seed == 0) seed = (unsigned int)time(NULL);
     srand(seed);
 
+    printf("gguf_infer v5 (packfix+chat+eos=%d)\n", eos_token);
     ctx = gguf_load(model_path);
     if (!ctx) return 1;
 
@@ -1419,6 +1580,7 @@ int main(int argc, char **argv) {
     hp = ctx->hp;
 
     if (tok_path && tok_path[0]) load_tokenizer(tok_path);
+    if (!g_vocab) load_tokenizer_from_gguf(ctx);
 
     if (build_model(ctx, &m, &hp, n_heads_user, n_kv_user, hidden_user, seq_user) != 0) {
         gguf_free(ctx);
@@ -1431,74 +1593,100 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Scan special tokens */
+    scan_special_tokens();
+
     prompt_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
-    prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
 
-    printf("Prompt: '%s' (%d tokens)\n", prompt, prompt_len);
-    printf("Max tokens: %d | temp: %.2f | seed: %u | seq: %d\n", n_generate, temp, seed, m.max_seq_len);
-    printf("---\n");
+    /* Build prompt tokens */
+    if (do_chat) {
+        /* ChatML format: <|im_start|>user\nPROMPT\n<|im_end|>\n<|im_start|>assistant\n */
+        int tok_im_start = find_special_token("<|im_start|>");
+        int tok_im_end = find_special_token("<|im_end|>");
+        int n = 0;
+        int tmp_tok[256];
+        int tmp_n;
 
-    /* Prefill: process all prompt tokens silently to fill KV cache */
-    {
-        clock_t prefill_t0 = clock();
-        for (pos = 0; pos < prompt_len; pos++) {
-            next_token = forward(&m, &s, prompt_tokens[pos], pos, 0.0f);
-        }
-        {
-            clock_t prefill_t1 = clock();
-            double prefill_sec = (double)(prefill_t1 - prefill_t0) / (double)CLOCKS_PER_SEC;
-            printf("[Prefill] %d prompt tokens in %.2f sec (%.2f sec/token)\n",
-                   prompt_len, prefill_sec,
-                   prompt_len > 0 ? prefill_sec / prompt_len : 0.0);
-            printf("---\n");
-        }
+        if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
+        if (tok_im_end < 0) tok_im_end = find_special_token("</s>");  /* fallback to EOS */
+
+        printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+
+        /* <|im_start|> */
+        if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
+
+        /* "user\n" */
+        tmp_n = tokenize("user\n", tmp_tok, 256, m.vocab_size);
+        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+        /* user prompt */
+        tmp_n = tokenize(prompt, tmp_tok, 256, m.vocab_size);
+        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+        /* "\n" */
+        tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
+        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+        /* <|im_end|> or </s> */
+        if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
+
+        /* "\n" */
+        tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
+        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+        /* <|im_start|> */
+        if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
+
+        /* "assistant\n" */
+        tmp_n = tokenize("assistant\n", tmp_tok, 256, m.vocab_size);
+        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+        prompt_len = n;
+    } else {
+        prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
     }
 
-    /* Generation: stream tokens with live TPS */
+    /* Debug: show first 30 prompt tokens */
+    printf("Prompt tokens (%d): ", prompt_len);
+    for (i = 0; i < prompt_len && i < 30; i++) {
+        printf("[%d]", prompt_tokens[i]);
+        if (g_vocab && prompt_tokens[i] >= 0 && prompt_tokens[i] < g_vocab_n) {
+            int tlen = g_vocab[prompt_tokens[i]].len;
+            if (tlen > 0 && tlen < 20) {
+                printf("'");
+                fwrite(g_vocab[prompt_tokens[i]].text, 1, tlen, stdout);
+                printf("' ");
+            }
+        }
+    }
+    printf("\n");
+
+    /* Process prompt tokens silently to fill KV cache */
+    for (pos = 0; pos < prompt_len; pos++) {
+        next_token = forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0);
+    }
+
+    /* Generation: stream words with repetition penalty */
     {
-        clock_t gen_t0 = clock();
-        clock_t now;
-        int last_i = 0;
+        int *last_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
+        int n_last = 0;
+        int printed = 0;
         for (i = 0; i < n_generate; i++) {
             if (pos >= m.max_seq_len) break;
-            next_token = forward(&m, &s, next_token, pos, temp);
-            detokenize(next_token);
-            fflush(stdout);
+            next_token = forward(&m, &s, next_token, pos, temp, top_k, last_tokens, n_last);
             pos++;
-
-            /* Stop on EOS: token 0 or last vocab token (e.g. 49151) */
-            if (next_token == 0 || next_token == m.vocab_size - 1) {
-                printf(" [EOS:%d]", next_token);
-                fflush(stdout);
-                i++;
+            if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
+            /* Break on configured EOS token or PAD */
+            if (next_token == 0 || next_token == eos_token) {
                 break;
             }
-
-            /* Report TPS every 5 tokens or on last token */
-            now = clock();
-            if (i - last_i >= 4 || i == n_generate - 1 || pos >= m.max_seq_len) {
-                double gen_elapsed = (double)(now - gen_t0) / (double)CLOCKS_PER_SEC;
-                int gen_count = i + 1;
-                double tps = gen_elapsed > 0 ? (double)gen_count / gen_elapsed : 0.0;
-                double tpk = gen_count > 0 ? gen_elapsed / gen_count : 0.0;
-                printf(" [T+%d | %.2fs | %.2f TPS | %.2fs/T]",
-                       gen_count, gen_elapsed, tps, tpk);
-                fflush(stdout);
-                last_i = i;
-            }
+            detokenize(next_token, m.vocab_size);
+            printed++;
+            fflush(stdout);
         }
-        {
-            clock_t gen_t1 = clock();
-            double gen_sec = (double)(gen_t1 - gen_t0) / (double)CLOCKS_PER_SEC;
-            int gen_count = i;
-            double tps = gen_sec > 0 ? (double)gen_count / gen_sec : 0.0;
-            printf("\n---\n");
-            printf("[Done] Generated %d tokens in %.2f sec | Avg %.2f TPS | %.2f sec/token | %.1f tokens/min\n",
-                   gen_count, gen_sec, tps,
-                   gen_count > 0 ? gen_sec / gen_count : 0.0,
-                   gen_sec > 0 ? (60.0 * gen_count) / gen_sec : 0.0);
-        }
+        free(last_tokens);
     }
+    printf("\n");
 
     free(prompt_tokens);
     free_runstate(&s);
