@@ -20,9 +20,42 @@ typedef unsigned short u16;
 typedef unsigned char u8;
 typedef signed char s8;
 
-typedef struct { float d; u8 qs[16]; } BlockQ4;
-typedef struct { float d; s8 qs[32]; } BlockQ8;
+typedef enum {
+    ARCH_LLAMA = 0,
+    ARCH_LLAMA2,
+    ARCH_LLAMA3,
+    ARCH_LLAMA4,
+    ARCH_MISTRAL,
+    ARCH_MIXTRAL,
+    ARCH_NEMO,
+    ARCH_QWEN2,
+    ARCH_QWEN3,
+    ARCH_QWEN25,
+    ARCH_GEMMA,
+    ARCH_GEMMA2,
+    ARCH_GEMMA3,
+    ARCH_GPT2,
+    ARCH_GPT_OSS,
+    ARCH_GPT_NEOX,
+    ARCH_GPT_J,
+    ARCH_PHI,
+    ARCH_PHI3,
+    ARCH_PHI4,
+    ARCH_STABLELM,
+    ARCH_CODELLAMA,
+    ARCH_FALCON,
+    ARCH_BAICHUAN,
+    ARCH_YI,
+    ARCH_DEEPSEEK,
+    ARCH_COMMAND_R,
+    ARCH_GRANITE,
+    ARCH_UNKNOWN
+} Arch;
+
+typedef struct { u16 d; u8 qs[16]; } BlockQ4;
+typedef struct { u16 d; s8 qs[32]; } BlockQ8;
 typedef struct { u16 d; u8 qh[4]; u8 qs[16]; } BlockQ5_0;
+typedef struct { u16 d; u16 m; u8 qh[4]; u8 qs[16]; } BlockQ5_1;
 
 typedef struct {
     char name[80];
@@ -44,6 +77,7 @@ typedef struct {
     u32 rope_dimension_count;
     float rope_freq_base;
     u32 alignment;
+    char architecture[32];
 } HParams;
 
 typedef struct {
@@ -53,6 +87,10 @@ typedef struct {
     Tensor *tensors;
     u64 data_offset;
     HParams hp;
+#ifdef _WIN32
+    HANDLE hFile;
+    HANDLE hMapping;
+#endif
 } GGUFContext;
 
 typedef struct {
@@ -77,6 +115,8 @@ typedef struct {
     Tensor **ffn_gate;
     Tensor **ffn_up;
     Tensor **ffn_down;
+    Arch arch;
+    float repeat_penalty;
 } Model;
 
 typedef struct {
@@ -93,6 +133,9 @@ typedef struct { int len; char *text; } TokenEntry;
 static TokenEntry *g_vocab = NULL;
 static int g_vocab_n = 0;
 static u8 *g_tok_buf = NULL;
+static int g_clean_output = 0;
+static int g_no_embed_cache = 0;
+static int g_n_threads = 1;
 
 /* --- GGUF I/O --- */
 
@@ -185,6 +228,16 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
     return 0;
 }
 
+static int meta_key_eq(const char *key, const char *prefix, const char *suffix) {
+    size_t plen = strlen(prefix);
+    size_t slen = strlen(suffix);
+    size_t klen = strlen(key);
+    if (klen != plen + slen) return 0;
+    if (memcmp(key, prefix, plen) != 0) return 0;
+    if (memcmp(key + plen, suffix, slen) != 0) return 0;
+    return 1;
+}
+
 static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
     u64 i;
     u32 vtype;
@@ -194,6 +247,7 @@ static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
     hp->alignment = 32;
     hp->attention_layer_norm_rms_epsilon = 1e-6f;
     hp->rope_freq_base = 10000.0f;
+    strcpy(hp->architecture, "llama");
     for (i = 0; i < n_kv; i++) {
         keylen = read_u64(p);
         if (keylen > 255) keylen = 255;
@@ -201,24 +255,48 @@ static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
         vtype = read_u32(p);
         if (strcmp(key, "general.alignment") == 0 && vtype == 4) {
             hp->alignment = read_u32(p);
-        } else if (strcmp(key, "llama.context_length") == 0 && vtype == 4) {
-            hp->context_length = read_u32(p);
-        } else if (strcmp(key, "llama.embedding_length") == 0 && vtype == 4) {
-            hp->embedding_length = read_u32(p);
-        } else if (strcmp(key, "llama.feed_forward_length") == 0 && vtype == 4) {
-            hp->feed_forward_length = read_u32(p);
-        } else if (strcmp(key, "llama.block_count") == 0 && vtype == 4) {
-            hp->block_count = read_u32(p);
-        } else if (strcmp(key, "llama.attention.head_count") == 0 && vtype == 4) {
-            hp->attention_head_count = read_u32(p);
-        } else if (strcmp(key, "llama.attention.head_count_kv") == 0 && vtype == 4) {
-            hp->attention_head_count_kv = read_u32(p);
-        } else if (strcmp(key, "llama.attention.layer_norm_rms_epsilon") == 0 && vtype == 6) {
-            float val; memcpy(&val, *p, 4); *p += 4; hp->attention_layer_norm_rms_epsilon = val;
-        } else if (strcmp(key, "llama.rope.dimension_count") == 0 && vtype == 4) {
-            hp->rope_dimension_count = read_u32(p);
-        } else if (strcmp(key, "llama.rope.freq_base") == 0 && vtype == 6) {
-            float val; memcpy(&val, *p, 4); *p += 4; hp->rope_freq_base = val;
+        } else if (meta_key_eq(key, "llama.", "context_length") ||
+                   meta_key_eq(key, "qwen2.", "context_length") ||
+                   strcmp(key, "context_length") == 0) {
+            if (vtype == 4) hp->context_length = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.", "embedding_length") ||
+                   meta_key_eq(key, "qwen2.", "embedding_length") ||
+                   strcmp(key, "embedding_length") == 0) {
+            if (vtype == 4) hp->embedding_length = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.", "feed_forward_length") ||
+                   meta_key_eq(key, "qwen2.", "feed_forward_length") ||
+                   strcmp(key, "feed_forward_length") == 0) {
+            if (vtype == 4) hp->feed_forward_length = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.", "block_count") ||
+                   meta_key_eq(key, "qwen2.", "block_count") ||
+                   strcmp(key, "block_count") == 0) {
+            if (vtype == 4) hp->block_count = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.attention.", "head_count") ||
+                   meta_key_eq(key, "qwen2.attention.", "head_count") ||
+                   strcmp(key, "attention.head_count") == 0) {
+            if (vtype == 4) hp->attention_head_count = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.attention.", "head_count_kv") ||
+                   meta_key_eq(key, "qwen2.attention.", "head_count_kv") ||
+                   strcmp(key, "attention.head_count_kv") == 0) {
+            if (vtype == 4) hp->attention_head_count_kv = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.attention.", "layer_norm_rms_epsilon") ||
+                   meta_key_eq(key, "qwen2.attention.", "layer_norm_rms_epsilon") ||
+                   strcmp(key, "attention.layer_norm_rms_epsilon") == 0) {
+            if (vtype == 6) { float val; memcpy(&val, *p, 4); *p += 4; hp->attention_layer_norm_rms_epsilon = val; } else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.rope.", "dimension_count") ||
+                   meta_key_eq(key, "qwen2.rope.", "dimension_count") ||
+                   strcmp(key, "rope.dimension_count") == 0) {
+            if (vtype == 4) hp->rope_dimension_count = read_u32(p); else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "llama.rope.", "freq_base") ||
+                   meta_key_eq(key, "qwen2.rope.", "freq_base") ||
+                   strcmp(key, "rope.freq_base") == 0) {
+            if (vtype == 6) { float val; memcpy(&val, *p, 4); *p += 4; hp->rope_freq_base = val; } else skip_value(vtype, p);
+        } else if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
+            u64 slen = read_u64(p);
+            if (slen > 31) slen = 31;
+            memcpy(hp->architecture, *p, (size_t)slen);
+            hp->architecture[slen] = '\0';
+            *p += slen;
         } else {
             skip_value(vtype, p);
         }
@@ -236,19 +314,55 @@ static GGUFContext *gguf_load(const char *path) {
     u64 pos_after_tensors;
     GGUFContext *ctx;
 
+    ctx = (GGUFContext*)malloc(sizeof(GGUFContext));
+    if (!ctx) { printf("Error: cannot allocate GGUFContext (%u bytes)\n", (unsigned int)sizeof(GGUFContext)); return NULL; }
+    memset(ctx, 0, sizeof(GGUFContext));
+    file_size = 0;
+
+#ifdef _WIN32
+    {
+        HANDLE hFile, hMapping;
+        DWORD sizeLow, sizeHigh;
+        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            sizeLow = GetFileSize(hFile, &sizeHigh);
+            if (sizeLow != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
+                file_size = ((u64)sizeHigh << 32) | (u64)sizeLow;
+                printf("Loading %s (%.1f MB) via memory map...\n", path, (double)file_size / (1024.0*1024.0));
+                hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+                if (hMapping) {
+                    ctx->base = (u8*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+                    if (ctx->base) {
+                        ctx->hFile = hFile;
+                        ctx->hMapping = hMapping;
+                        ctx->size = (size_t)file_size;
+                        goto loaded;
+                    }
+                    printf("Warning: MapViewOfFile failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
+                    CloseHandle(hMapping);
+                } else {
+                    printf("Warning: CreateFileMapping failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
+                }
+            }
+            CloseHandle(hFile);
+        }
+    }
+#endif
+
     f = fopen(path, "rb");
-    if (!f) { printf("Error: cannot open %s\n", path); return NULL; }
+    if (!f) { printf("Error: cannot open %s\n", path); free(ctx); return NULL; }
     fseek(f, 0, SEEK_END);
     file_size = (u64)ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    ctx = (GGUFContext*)malloc(sizeof(GGUFContext));
+    printf("Loading %s (%.1f MB) via fread...\n", path, (double)file_size / (1024.0*1024.0));
     ctx->size = (size_t)file_size;
     ctx->base = (u8*)malloc((size_t)file_size);
+    if (!ctx->base) { printf("Error: cannot allocate %.1f MB for model file (out of memory?)\n", (double)file_size / (1024.0*1024.0)); free(ctx); fclose(f); return NULL; }
     read_bytes = fread(ctx->base, 1, (size_t)file_size, f);
     fclose(f);
     if ((u64)read_bytes != file_size) { printf("Error: incomplete read\n"); free(ctx->base); free(ctx); return NULL; }
 
+loaded:
     p = ctx->base;
     if (memcmp(p, "GGUF", 4) != 0) { printf("Error: not a GGUF file\n"); free(ctx->base); free(ctx); return NULL; }
     p += 4;
@@ -293,6 +407,7 @@ static GGUFContext *gguf_load(const char *path) {
 
     ctx->n_tensors = tensor_count;
     ctx->tensors = (Tensor*)malloc(sizeof(Tensor) * (size_t)tensor_count);
+    if (!ctx->tensors) { printf("Error: cannot allocate tensor table (%u bytes)\n", (unsigned int)(sizeof(Tensor) * (size_t)tensor_count)); free(ctx->base); free(ctx); return NULL; }
     memset(ctx->tensors, 0, sizeof(Tensor) * (size_t)tensor_count);
     for (i = 0; i < tensor_count; i++) {
         Tensor *t = &ctx->tensors[i];
@@ -317,7 +432,17 @@ static GGUFContext *gguf_load(const char *path) {
 static void gguf_free(GGUFContext *ctx) {
     if (!ctx) return;
     free(ctx->tensors);
+#ifdef _WIN32
+    if (ctx->hMapping) {
+        UnmapViewOfFile(ctx->base);
+        CloseHandle(ctx->hMapping);
+        CloseHandle(ctx->hFile);
+    } else {
+        free(ctx->base);
+    }
+#else
     free(ctx->base);
+#endif
     free(ctx);
 }
 
@@ -431,30 +556,38 @@ static float silu(float x) {
 }
 
 /* llama.cpp-style top-k + temperature sampling */
+#define MAX_TOPK 256
 static int sample_topk(float *logits, int n, float temp, int top_k) {
     int i, k;
     float maxv, sum, r, cdf;
-    /* Find top-k threshold: k-th largest value */
+    /* top-k filtering using arrays (safe for negative logits) */
     if (top_k > 0 && top_k < n) {
-        for (k = 0; k < top_k; k++) {
-            int best_idx = -1;
-            float best_val = -1e30f;
-            for (i = 0; i < n; i++) {
-                if (logits[i] > best_val) {
-                    best_val = logits[i];
-                    best_idx = i;
+        int kk = top_k;
+        int top_idx[MAX_TOPK];
+        float top_val[MAX_TOPK];
+        if (kk > MAX_TOPK) kk = MAX_TOPK;
+        for (k = 0; k < kk; k++) {
+            top_idx[k] = -1;
+            top_val[k] = -1e30f;
+        }
+        for (i = 0; i < n; i++) {
+            float v = logits[i];
+            for (k = 0; k < kk; k++) {
+                if (v > top_val[k]) {
+                    int j;
+                    for (j = kk - 1; j > k; j--) {
+                        top_val[j] = top_val[j - 1];
+                        top_idx[j] = top_idx[j - 1];
+                    }
+                    top_val[k] = v;
+                    top_idx[k] = i;
+                    break;
                 }
             }
-            /* Mark as kept by negating (we restore later) */
-            if (best_idx >= 0) logits[best_idx] = -logits[best_idx];
         }
-        /* Zero out everything below top-k, restore kept values */
-        for (i = 0; i < n; i++) {
-            if (logits[i] > 0.0f || logits[i] == 0.0f) {
-                logits[i] = -1e30f; /* was NOT selected, zero out */
-            } else {
-                logits[i] = -logits[i]; /* restore original value */
-            }
+        for (i = 0; i < n; i++) logits[i] = -1e30f;
+        for (k = 0; k < kk; k++) {
+            if (top_idx[k] >= 0) logits[top_idx[k]] = top_val[k];
         }
     }
     /* Greedy (temp = 0) */
@@ -475,6 +608,11 @@ static int sample_topk(float *logits, int n, float temp, int top_k) {
         } else {
             logits[i] = 0.0f;
         }
+    }
+    if (sum <= 0.0f) {
+        int best = 0;
+        for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+        return best;
     }
     for (i = 0; i < n; i++) logits[i] /= sum;
     /* Sample from distribution */
@@ -506,6 +644,10 @@ static void matvec_f32(const float *w, const float *x, float *y, int n, int d) {
     }
 }
 
+static float fp16_to_fp32(u16 h);
+static void dequantize_row(const Tensor *t, float *out, int row, int d);
+static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row);
+
 static void matvec_q4(const BlockQ4 *w, const float *x, float *y, int n, int d) {
     int nb = d / 32;
     int i, b, j;
@@ -513,7 +655,7 @@ static void matvec_q4(const BlockQ4 *w, const float *x, float *y, int n, int d) 
         float sum = 0.0f;
         for (b = 0; b < nb; b++) {
             const BlockQ4 *blk = &w[i * nb + b];
-            float ds = blk->d;
+            float ds = fp16_to_fp32(blk->d);
             const float *xb = x + b * 32;
             const u8 *qs = blk->qs;
             for (j = 0; j + 3 < 16; j += 4) {
@@ -547,7 +689,7 @@ static void matvec_q8(const BlockQ8 *w, const float *x, float *y, int n, int d) 
         float sum = 0.0f;
         for (b = 0; b < nb; b++) {
             const BlockQ8 *blk = &w[i * nb + b];
-            float ds = blk->d;
+            float ds = fp16_to_fp32(blk->d);
             const float *xb = x + b * 32;
             const s8 *qs = blk->qs;
             for (j = 0; j + 3 < 32; j += 4) {
@@ -629,6 +771,31 @@ static void matvec_q5_0(const BlockQ5_0 *w, const float *x, float *y, int n, int
                 int x1 = ((blk->qs[j] >>   4) | xh_1) - 16;
                 sum += xb[j * 2 + 0] * (float)x0 * ds
                      + xb[j * 2 + 1] * (float)x1 * ds;
+            }
+        }
+        y[i] = sum;
+    }
+}
+
+static void matvec_q5_1(const BlockQ5_1 *w, const float *x, float *y, int n, int d) {
+    int nb = d / 32;
+    int i, b, j;
+    for (i = 0; i < n; i++) {
+        float sum = 0.0f;
+        for (b = 0; b < nb; b++) {
+            const BlockQ5_1 *blk = &w[i * nb + b];
+            float ds = fp16_to_fp32(blk->d);
+            float mn = fp16_to_fp32(blk->m);
+            u32 qh;
+            const float *xb = x + b * 32;
+            memcpy(&qh, blk->qh, sizeof(qh));
+            for (j = 0; j < 16; j++) {
+                u8 xh_0 = (u8)(((qh >> (j + 0)) << 4) & 0x10);
+                u8 xh_1 = (u8)(((qh >> (j + 16))     ) & 0x10);
+                int x0 = (blk->qs[j] & 0x0F) | xh_0;
+                int x1 = (blk->qs[j] >>   4) | xh_1;
+                sum += xb[j * 2 + 0] * ((float)x0 * ds + mn)
+                     + xb[j * 2 + 1] * ((float)x1 * ds + mn);
             }
         }
         y[i] = sum;
@@ -741,6 +908,139 @@ static void matvec_q6k(const BlockQ6K *w, const float *x, float *y, int n, int d
     }
 }
 
+/* --- Multi-threading helpers (WinNT only: Win2K/XP) --- */
+
+static int is_winnt(void) {
+#ifdef _WIN32
+    return (GetVersion() & 0x80000000) == 0;
+#else
+    return 0;
+#endif
+}
+
+static size_t tensor_row_bytes(const Tensor *t, int d) {
+    switch (t->type) {
+        case 0: return (size_t)d * sizeof(float);
+        case 1: return (size_t)d * sizeof(u16);
+        case 2: case 3: return (size_t)(d / 32) * sizeof(BlockQ4);
+        case 6: return (size_t)(d / 32) * sizeof(BlockQ5_0);
+        case 7: return (size_t)(d / 32) * sizeof(BlockQ5_1);
+        case 8: return (size_t)(d / 32) * sizeof(BlockQ8);
+        case 12: return (size_t)(d / 256) * sizeof(BlockQ4K);
+        case 13: return (size_t)(d / 256) * sizeof(BlockQ5K);
+        case 14: return (size_t)(d / 256) * sizeof(BlockQ6K);
+        default: return 0;
+    }
+}
+
+#ifdef _WIN32
+typedef struct {
+    Tensor sub_t;
+    const float *x;
+    float *y;
+    int n;
+    int d;
+} MatvecThreadWork;
+
+static DWORD WINAPI matvec_thread_func(LPVOID arg) {
+    MatvecThreadWork *w = (MatvecThreadWork*)arg;
+    matvec(&w->sub_t, w->x, w->y, w->n, w->d, NULL);
+    return 0;
+}
+
+typedef struct {
+    const Tensor *t;
+    const float *x;
+    float *partial;
+    int start_d;
+    int end_d;
+    int vocab_size;
+} TransposedOutputThreadWork;
+
+static DWORD WINAPI transposed_output_thread(LPVOID arg) {
+    TransposedOutputThreadWork *w = (TransposedOutputThreadWork*)arg;
+    int d2, v;
+    float *dq_row = (float*)malloc(w->vocab_size * sizeof(float));
+    if (!dq_row) return 1;
+    memset(w->partial, 0, w->vocab_size * sizeof(float));
+    for (d2 = w->start_d; d2 < w->end_d; d2++) {
+        dequantize_row(w->t, dq_row, d2, w->vocab_size);
+        for (v = 0; v < w->vocab_size; v++) {
+            w->partial[v] += w->x[d2] * dq_row[v];
+        }
+    }
+    free(dq_row);
+    return 0;
+}
+#endif
+
+static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, int d) {
+#ifdef _WIN32
+    size_t row_bytes;
+    int mid;
+    HANDLE threads[2];
+    MatvecThreadWork work[2];
+    DWORD tid0, tid1;
+
+    if (g_n_threads < 2 || !is_winnt()) {
+        matvec(t, x, y, n, d, NULL);
+        return;
+    }
+
+    /* Only parallelize standard row-major non-transposed matrices */
+    if (!((int)t->dims[0] == n && (int)t->dims[1] == d)) {
+        matvec(t, x, y, n, d, NULL);
+        return;
+    }
+
+    row_bytes = tensor_row_bytes(t, d);
+    if (row_bytes == 0) {
+        matvec(t, x, y, n, d, NULL);
+        return;
+    }
+
+    mid = n / 2;
+    if (mid == 0) {
+        matvec(t, x, y, n, d, NULL);
+        return;
+    }
+
+    /* Work 0: rows [0, mid) */
+    work[0].sub_t = *t;
+    work[0].sub_t.data = t->data;
+    work[0].sub_t.dims[0] = (u64)mid;
+    work[0].x = x;
+    work[0].y = y;
+    work[0].n = mid;
+    work[0].d = d;
+
+    /* Work 1: rows [mid, n) */
+    work[1].sub_t = *t;
+    work[1].sub_t.data = (u8*)t->data + (size_t)mid * row_bytes;
+    work[1].sub_t.dims[0] = (u64)(n - mid);
+    work[1].x = x;
+    work[1].y = y + mid;
+    work[1].n = n - mid;
+    work[1].d = d;
+
+    threads[0] = CreateThread(NULL, 0, matvec_thread_func, &work[0], 0, &tid0);
+    threads[1] = CreateThread(NULL, 0, matvec_thread_func, &work[1], 0, &tid1);
+
+    if (threads[0] && threads[1]) {
+        WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+        CloseHandle(threads[0]);
+        CloseHandle(threads[1]);
+    } else {
+        /* Thread creation failed, fall back to single-threaded */
+        if (threads[0]) CloseHandle(threads[0]);
+        if (threads[1]) CloseHandle(threads[1]);
+        matvec(t, x, y, n, d, NULL);
+    }
+#else
+    matvec(t, x, y, n, d, NULL);
+#endif
+}
+
 static void dequantize_row(const Tensor *t, float *out, int row, int d) {
     if (t->type == 0) {
         memcpy(out, (const float*)t->data + row * d, d * sizeof(float));
@@ -753,7 +1053,7 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
         const BlockQ4 *blk = (const BlockQ4*)t->data + row * nb;
         int j;
         for (j = 0; j < d; j += 32) {
-            float ds = blk->d;
+            float ds = fp16_to_fp32(blk->d);
             int jj;
             for (jj = 0; jj < 16; jj++) {
                 u8 qv = blk->qs[jj];
@@ -767,7 +1067,7 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
         const BlockQ8 *blk = (const BlockQ8*)t->data + row * nb;
         int j;
         for (j = 0; j < d; j += 32) {
-            float ds = blk->d;
+            float ds = fp16_to_fp32(blk->d);
             int jj;
             for (jj = 0; jj < 32; jj++) out[j + jj] = ds * (float)blk->qs[jj];
             blk++;
@@ -788,6 +1088,26 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
                 int x1 = ((blk->qs[jj] >>   4) | xh_1) - 16;
                 out[j + jj + 0   ] = (float)x0 * ds;
                 out[j + jj + 16] = (float)x1 * ds;
+            }
+            blk++;
+        }
+    } else if (t->type == 7) {
+        int nb = d / 32;
+        const BlockQ5_1 *blk = (const BlockQ5_1*)t->data + row * nb;
+        int j;
+        for (j = 0; j < d; j += 32) {
+            int jj;
+            float ds = fp16_to_fp32(blk->d);
+            float mn = fp16_to_fp32(blk->m);
+            u32 qh;
+            memcpy(&qh, blk->qh, sizeof(qh));
+            for (jj = 0; jj < 16; jj++) {
+                u8 xh_0 = (u8)(((qh >> (jj + 0)) << 4) & 0x10);
+                u8 xh_1 = (u8)(((qh >> (jj + 16))     ) & 0x10);
+                int x0 = (blk->qs[jj] & 0x0F) | xh_0;
+                int x1 = (blk->qs[jj] >>   4) | xh_1;
+                out[j + jj + 0   ] = (float)x0 * ds + mn;
+                out[j + jj + 16] = (float)x1 * ds + mn;
             }
             blk++;
         }
@@ -891,32 +1211,16 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
     }
 }
 
-static float *cache_tensor_f32(const Tensor *t, int n, int d) {
-    /* Pre-dequantize a [n, d] quantized tensor to contiguous f32 buffer.
-       Returns NULL on failure or if already f32. Caller must free(). */
-    float *cache;
-    int i;
-    float *tmp;
-    if (!t || t->type == 0) return NULL;
-    cache = (float*)malloc((size_t)n * d * sizeof(float));
-    if (!cache) {
-        fprintf(stderr, "Warning: failed to allocate f32 cache for %s\n", t->name);
-        return NULL;
-    }
-    tmp = (float*)malloc(d * sizeof(float));
-    if (!tmp) {
-        free(cache);
-        fprintf(stderr, "Warning: failed to allocate tmp row for %s\n", t->name);
-        return NULL;
-    }
-    printf("Dequantizing %s to f32 cache (%u KB)...\n", t->name,
-           (unsigned int)((size_t)n * d * sizeof(float) / 1024));
-    for (i = 0; i < n; i++) {
-        dequantize_row(t, tmp, i, d);
-        memcpy(cache + (size_t)i * d, tmp, d * sizeof(float));
-    }
-    free(tmp);
-    return cache;
+static int effective_seq_limit(int requested, int n_layers, int n_kv_heads, int head_dim) {
+    /* Cap sequence length to keep KV cache under ~256MB total (k+v) */
+    unsigned int max_kv_bytes = 64U * 1024U * 1024U;
+    unsigned int bytes_per_pos = (unsigned int)((u64)n_layers * (u64)n_kv_heads * (u64)head_dim * 2U * 4U);
+    int limit;
+    if (bytes_per_pos == 0) return requested;
+    limit = (int)(max_kv_bytes / bytes_per_pos);
+    if (limit < 128) limit = 128;
+    if (limit > requested) limit = requested;
+    return limit;
 }
 
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
@@ -936,6 +1240,12 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
         }
         return;
     }
+    /* Parallelize large non-transposed matrices on WinNT */
+    if (g_n_threads > 1 && n >= 10000 && is_winnt() &&
+        (int)t->dims[0] == n && (int)t->dims[1] == d) {
+        matvec_parallel(t, x, y, n, d);
+        return;
+    }
     if (t->type == 0) {
         matvec_f32((const float*)t->data, x, y, n, d);
     } else if (t->type == 1) {
@@ -944,6 +1254,8 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
         matvec_q4((const BlockQ4*)t->data, x, y, n, d);
     } else if (t->type == 6) {
         matvec_q5_0((const BlockQ5_0*)t->data, x, y, n, d);
+    } else if (t->type == 7) {
+        matvec_q5_1((const BlockQ5_1*)t->data, x, y, n, d);
     } else if (t->type == 8) {
         matvec_q8((const BlockQ8*)t->data, x, y, n, d);
     } else if (t->type == 12) {
@@ -963,7 +1275,6 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
 static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user, int n_kv_user, int hidden_user, int seq_user) {
     int i;
     Tensor *t;
-    memset(m, 0, sizeof(Model));
 
     t = find_tensor(ctx, "token_embd.weight");
     if (!t) t = find_tensor(ctx, "tok_embeddings.weight");
@@ -992,34 +1303,43 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     }
 
     /* Pre-dequantize embeddings to f32 cache for fast lookup */
-    if (m->tok_embd->type != 0) {
+    if (!g_no_embed_cache && m->tok_embd->type != 0) {
         int vs = m->vocab_size;
         int dm = m->dim;
         int j, tk;
-        float *tmp = (float*)malloc(vs * sizeof(float));
-        m->cached_embd = (float*)malloc((size_t)vs * dm * sizeof(float));
-        if (!tmp || !m->cached_embd) {
-            fprintf(stderr, "Warning: failed to allocate embedding cache, using slow dequant path\n");
-            if (tmp) free(tmp);
-            if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
+        size_t cache_bytes = (size_t)vs * dm * sizeof(float);
+        if (cache_bytes > 256U * 1024U * 1024U) {
+            printf("Embedding cache too large (%u MB > 256MB), using slow per-token dequant.\n",
+                   (unsigned int)(cache_bytes / (1024U * 1024U)));
+            m->cached_embd = NULL;
         } else {
-            printf("Dequantizing embeddings to f32 cache (%u KB)...\n", (unsigned int)((size_t)vs * dm * sizeof(float) / 1024));
-            if (m->tok_embd_transposed) {
-                for (j = 0; j < dm; j++) {
-                    dequantize_row(m->tok_embd, tmp, j, vs);
+            float *tmp = (float*)malloc(vs * sizeof(float));
+            m->cached_embd = (float*)malloc(cache_bytes);
+            if (!tmp || !m->cached_embd) {
+                fprintf(stderr, "Warning: failed to allocate embedding cache, using slow dequant path\n");
+                if (tmp) free(tmp);
+                if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
+            } else {
+                printf("Dequantizing embeddings to f32 cache (%u KB)...\n", (unsigned int)(cache_bytes / 1024));
+                if (m->tok_embd_transposed) {
+                    for (j = 0; j < dm; j++) {
+                        dequantize_row(m->tok_embd, tmp, j, vs);
+                        for (tk = 0; tk < vs; tk++) {
+                            m->cached_embd[tk * dm + j] = tmp[tk];
+                        }
+                    }
+                } else {
                     for (tk = 0; tk < vs; tk++) {
-                        m->cached_embd[tk * dm + j] = tmp[tk];
+                        dequantize_row(m->tok_embd, tmp, tk, dm);
+                        memcpy(m->cached_embd + tk * dm, tmp, dm * sizeof(float));
                     }
                 }
-            } else {
-                for (tk = 0; tk < vs; tk++) {
-                    dequantize_row(m->tok_embd, tmp, tk, dm);
-                    memcpy(m->cached_embd + tk * dm, tmp, dm * sizeof(float));
-                }
+                printf("Embedding cache ready.\n");
+                free(tmp);
             }
-            printf("Embedding cache ready.\n");
-            free(tmp);
         }
+    } else if (g_no_embed_cache && m->tok_embd->type != 0) {
+        printf("Embedding cache disabled (--no-embed-cache), using slow per-token dequant.\n");
     }
 
     t = find_tensor(ctx, "output_norm.weight");
@@ -1079,6 +1399,15 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     else if (hp->context_length > 0) m->max_seq_len = (int)hp->context_length;
     else m->max_seq_len = 2048;
 
+    {
+        int safe_seq = effective_seq_limit(m->max_seq_len, m->n_layers, m->n_kv_heads, m->head_dim);
+        if (safe_seq < m->max_seq_len) {
+            printf("WARNING: capping seq_len %d -> %d to keep KV cache under 256MB\n",
+                   m->max_seq_len, safe_seq);
+            m->max_seq_len = safe_seq;
+        }
+    }
+
     m->norm_eps = hp->attention_layer_norm_rms_epsilon;
     if (m->norm_eps == 0.0f) m->norm_eps = 1e-5f;
     m->rope_theta = hp->rope_freq_base;
@@ -1114,6 +1443,11 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     m->ffn_gate = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_up = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_down = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
+    if (!m->attn_norm || !m->attn_q || !m->attn_k || !m->attn_v || !m->attn_o ||
+        !m->ffn_norm || !m->ffn_gate || !m->ffn_up || !m->ffn_down) {
+        fprintf(stderr, "Failed to allocate layer tensor pointers (out of memory?)\n");
+        return 1;
+    }
 
     for (i = 0; i < m->n_layers; i++) {
         char name[128];
@@ -1142,29 +1476,38 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             fprintf(stderr, "Missing tensors for layer %d\n", i);
             return 1;
         }
+        if (m->attn_norm[i] && m->attn_norm[i]->type != 0)
+            printf("Warning: layer %d attn_norm is type %u (expected F32)\n", i, m->attn_norm[i]->type);
+        if (m->ffn_norm[i] && m->ffn_norm[i]->type != 0)
+            printf("Warning: layer %d ffn_norm is type %u (expected F32)\n", i, m->ffn_norm[i]->type);
     }
 
-    /* Pre-dequantize heaviest weights to f32 for fast matmul */
+    /* Pre-dequantize heaviest weights to f32 for fast matmul.
+       On low-RAM systems (e.g. WinME with 1.5GB), caching anything
+       beyond the embedding cache is unsafe. attn_k/v are small but
+       cause heap fragmentation; ffn_down is huge. All disabled. */
     {
         int l;
         m->cached_attn_k = (float**)malloc(sizeof(float*) * m->n_layers);
         m->cached_attn_v = (float**)malloc(sizeof(float*) * m->n_layers);
         m->cached_ffn_down = (float**)malloc(sizeof(float*) * m->n_layers);
+        if (!m->cached_attn_k || !m->cached_attn_v || !m->cached_ffn_down) {
+            fprintf(stderr, "Failed to allocate cache pointer arrays (out of memory?)\n");
+            return 1;
+        }
         for (l = 0; l < m->n_layers; l++) {
             m->cached_attn_k[l] = NULL;
             m->cached_attn_v[l] = NULL;
             m->cached_ffn_down[l] = NULL;
         }
-        for (l = 0; l < m->n_layers; l++) {
-            int nk = m->n_kv_heads * m->head_dim;
-            m->cached_attn_k[l] = cache_tensor_f32(m->attn_k[l], nk, m->dim);
-            m->cached_attn_v[l] = cache_tensor_f32(m->attn_v[l], nk, m->dim);
-            m->cached_ffn_down[l] = cache_tensor_f32(m->ffn_down[l], m->dim, m->hidden_dim);
-        }
     }
 
     /* Diagnostics: verify block sizes and tensor offsets */
-    printf("Block sizes: Q4=%u(exp144) Q5=%u(exp176) Q6=%u(exp210)\n",
+    printf("Block sizes: Q4_0=%u Q5_0=%u Q5_1=%u Q8_0=%u Q4K=%u(exp144) Q5K=%u(exp176) Q6K=%u(exp210)\n",
+           (unsigned int)sizeof(BlockQ4),
+           (unsigned int)sizeof(BlockQ5_0),
+           (unsigned int)sizeof(BlockQ5_1),
+           (unsigned int)sizeof(BlockQ8),
            (unsigned int)sizeof(BlockQ4K),
            (unsigned int)sizeof(BlockQ5K),
            (unsigned int)sizeof(BlockQ6K));
@@ -1182,8 +1525,34 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
            (unsigned int)(ctx->data_offset & 0xFFFFFFFFUL),
            (unsigned int)(ctx->size & 0xFFFFFFFFUL));
 
-    printf("Model: dim=%d layers=%d heads=%d kv_heads=%d hidden=%d vocab=%d seq=%d\n",
-           m->dim, m->n_layers, m->n_heads, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len);
+    /* Architecture detection */
+    m->arch = ARCH_LLAMA;
+    if (strstr(hp->architecture, "qwen")) m->arch = ARCH_QWEN2;
+    else if (strstr(hp->architecture, "gemma3")) m->arch = ARCH_GEMMA3;
+    else if (strstr(hp->architecture, "gemma2")) m->arch = ARCH_GEMMA2;
+    else if (strstr(hp->architecture, "gemma")) m->arch = ARCH_GEMMA;
+    else if (strstr(hp->architecture, "gpt2")) m->arch = ARCH_GPT2;
+    else if (strstr(hp->architecture, "phi4")) m->arch = ARCH_PHI4;
+    else if (strstr(hp->architecture, "phi3")) m->arch = ARCH_PHI3;
+    else if (strstr(hp->architecture, "phi")) m->arch = ARCH_PHI;
+    else if (strstr(hp->architecture, "mistral")) m->arch = ARCH_MISTRAL;
+    else if (strstr(hp->architecture, "mixtral")) m->arch = ARCH_MIXTRAL;
+    else if (strstr(hp->architecture, "falcon")) m->arch = ARCH_FALCON;
+    else if (strstr(hp->architecture, "deepseek")) m->arch = ARCH_DEEPSEEK;
+    else if (strstr(hp->architecture, "granite")) m->arch = ARCH_GRANITE;
+    else if (strstr(hp->architecture, "yi")) m->arch = ARCH_YI;
+    else if (strstr(hp->architecture, "baichuan")) m->arch = ARCH_BAICHUAN;
+    else if (strstr(hp->architecture, "stablelm")) m->arch = ARCH_STABLELM;
+    else if (strstr(hp->architecture, "command-r")) m->arch = ARCH_COMMAND_R;
+    else if (strstr(hp->architecture, "codellama")) m->arch = ARCH_CODELLAMA;
+    else if (strstr(hp->architecture, "nemo")) m->arch = ARCH_NEMO;
+    else if (strstr(hp->architecture, "llama4")) m->arch = ARCH_LLAMA4;
+    else if (strstr(hp->architecture, "llama3")) m->arch = ARCH_LLAMA3;
+    else if (strstr(hp->architecture, "llama2")) m->arch = ARCH_LLAMA2;
+
+    printf("Model: dim=%d layers=%d heads=%d kv_heads=%d hidden=%d vocab=%d seq=%d arch=%s\n",
+           m->dim, m->n_layers, m->n_heads, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len,
+           hp->architecture);
     return 0;
 }
 
@@ -1388,18 +1757,68 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
     if (m->cached_embd && m->output == m->tok_embd) {
         /* Fast path: cached f32 embeddings for output projection */
         matvec_f32(m->cached_embd, x, s->logits, vocab_size, dim);
+    } else if (m->tok_embd_transposed && m->output == m->tok_embd) {
+        /* Transposed embedding: W is [dim, vocab], compute logits[v] = sum_d(x[d]*W[d,v]) */
+#ifdef _WIN32
+        if (g_n_threads > 1 && is_winnt() && dim >= 64) {
+            int mid_d = dim / 2;
+            float *partial1 = (float*)calloc(vocab_size, sizeof(float));
+            float *partial2 = (float*)calloc(vocab_size, sizeof(float));
+            TransposedOutputThreadWork work[2];
+            HANDLE threads[2];
+            DWORD tid0, tid1;
+            int v;
+            if (partial1 && partial2) {
+                work[0].t = m->output; work[0].x = x; work[0].partial = partial1;
+                work[0].start_d = 0; work[0].end_d = mid_d; work[0].vocab_size = vocab_size;
+                work[1].t = m->output; work[1].x = x; work[1].partial = partial2;
+                work[1].start_d = mid_d; work[1].end_d = dim; work[1].vocab_size = vocab_size;
+                threads[0] = CreateThread(NULL, 0, transposed_output_thread, &work[0], 0, &tid0);
+                threads[1] = CreateThread(NULL, 0, transposed_output_thread, &work[1], 0, &tid1);
+                if (threads[0] && threads[1]) {
+                    WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+                    CloseHandle(threads[0]);
+                    CloseHandle(threads[1]);
+                    for (v = 0; v < vocab_size; v++) {
+                        s->logits[v] = partial1[v] + partial2[v];
+                    }
+                } else {
+                    if (threads[0]) CloseHandle(threads[0]);
+                    if (threads[1]) CloseHandle(threads[1]);
+                    goto transposed_single;
+                }
+            } else {
+                transposed_single:
+#endif
+                {
+                    int d2, v;
+                    memset(s->logits, 0, vocab_size * sizeof(float));
+                    for (d2 = 0; d2 < dim; d2++) {
+                        dequantize_row(m->output, s->dq_row, d2, vocab_size);
+                        for (v = 0; v < vocab_size; v++) {
+                            s->logits[v] += x[d2] * s->dq_row[v];
+                        }
+                    }
+                }
+#ifdef _WIN32
+            }
+            if (partial1) free(partial1);
+            if (partial2) free(partial2);
+        } else {
+            goto transposed_single;
+        }
+#endif
     } else {
         matvec(m->output, x, s->logits, vocab_size, dim, s->dq_row);
     }
     /* Repetition penalty: discourage recent tokens */
     if (recent && recent_n > 0) {
-        float penalty = 1.15f;
         int j;
         for (j = 0; j < recent_n && j < 32; j++) {
             int tok = recent[j];
             if (tok > 0 && tok < vocab_size) {
-                if (s->logits[tok] > 0.0f) s->logits[tok] /= penalty;
-                else s->logits[tok] *= penalty;
+                if (s->logits[tok] > 0.0f) s->logits[tok] /= m->repeat_penalty;
+                else s->logits[tok] *= m->repeat_penalty;
             }
         }
     }
@@ -1407,6 +1826,9 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 }
 
 /* --- Tokenizer --- */
+
+static int *g_sorted_vocab = NULL;
+static int g_sorted_init = 0;
 
 static int load_tokenizer(const char *path) {
     FILE *f;
@@ -1416,6 +1838,7 @@ static int load_tokenizer(const char *path) {
     int i;
     size_t pos;
     if (g_tok_buf) { free(g_tok_buf); g_tok_buf = NULL; free(g_vocab); g_vocab = NULL; }
+    if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
     f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END); sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
@@ -1436,15 +1859,60 @@ static int load_tokenizer(const char *path) {
     return 1;
 }
 
+static void init_sorted_vocab(void) {
+    /* Counting sort by token length - O(n) instead of O(n^2) bubble sort.
+       Sorts descending by length (longest tokens first for greedy matching). */
+    int i;
+    int counts[65];
+    int offsets[65];
+    int cursors[65];
+    int len;
+    if (g_sorted_init || g_vocab_n <= 0) return;
+    g_sorted_vocab = (int*)malloc(sizeof(int) * g_vocab_n);
+    if (!g_sorted_vocab) return;
+    memset(counts, 0, sizeof(counts));
+    for (i = 0; i < g_vocab_n; i++) {
+        len = g_vocab[i].len;
+        if (len > 64) len = 64;
+        if (len < 0) len = 0;
+        counts[len]++;
+    }
+    offsets[64] = 0;
+    for (len = 63; len >= 0; len--) {
+        offsets[len] = offsets[len + 1] + counts[len + 1];
+    }
+    memcpy(cursors, offsets, sizeof(cursors));
+    for (i = 0; i < g_vocab_n; i++) {
+        len = g_vocab[i].len;
+        if (len > 64) len = 64;
+        if (len < 0) len = 0;
+        g_sorted_vocab[cursors[len]++] = i;
+    }
+    g_sorted_init = 1;
+    printf("Tokenizer sorted: %d tokens by length\n", g_vocab_n);
+}
+
 static int tokenize(const char *text, int *tokens, int max_tokens, int vocab_size) {
     int len = (int)strlen(text);
     int pos = 0;
     int n = 0;
     int i;
+    init_sorted_vocab();
     while (pos < len && n < max_tokens) {
         int best = -1;
         int best_len = 0;
-        if (g_vocab) {
+        if (g_vocab && g_sorted_init) {
+            for (i = 0; i < g_vocab_n; i++) {
+                int idx = g_sorted_vocab[i];
+                int tlen = g_vocab[idx].len;
+                if (tlen > best_len && pos + tlen <= len &&
+                    memcmp(text + pos, g_vocab[idx].text, tlen) == 0) {
+                    best_len = tlen;
+                    best = idx;
+                }
+                if (tlen < best_len) break;
+            }
+        } else if (g_vocab) {
             for (i = 0; i < g_vocab_n; i++) {
                 int tlen = g_vocab[i].len;
                 if (tlen > 0 && pos + tlen <= len && memcmp(text + pos, g_vocab[i].text, tlen) == 0) {
@@ -1456,8 +1924,7 @@ static int tokenize(const char *text, int *tokens, int max_tokens, int vocab_siz
             tokens[n++] = best;
             pos += best_len;
         } else {
-            if (vocab_size == 256) tokens[n++] = (unsigned char)text[pos];
-            else tokens[n++] = (int)(unsigned char)text[pos];
+            tokens[n++] = (unsigned char)text[pos];
             pos++;
         }
     }
@@ -1510,29 +1977,41 @@ int main(int argc, char **argv) {
     char *model_path = NULL;
     char *tok_path = NULL;
     char *prompt = "";
-    int n_generate = 50;
+    char *prompt_file = NULL;
+    int n_generate = 64;
     float temp = 0.8f;
-    unsigned int seed = 0;
+    float top_p = 0.95f;
+    int top_k = 40;
+    int eos_token = 2;
+    int no_eos_stop = 0;
+    int do_chat = 0;
+    int do_info = 0;
+    int do_list = 0;
+    int do_raw_tokens = 0;
+    int seq_user = 0;
     int n_heads_user = 0;
     int n_kv_user = 0;
     int hidden_user = 0;
-    int seq_user = 0;
-    int top_k = 40;
-    int eos_token = 2;
-    int do_chat = 0;
-    int do_list = 0;
+    unsigned int seed = 0;
     int arg;
     int pos;
     int prompt_len;
     int *prompt_tokens;
     int next_token = 0;
     int i;
+    (void)top_p;
 
     if (argc < 2) {
         printf("Usage: gguf_infer.exe <model.gguf> [options]\n");
         printf("Options:\n");
+        printf("  --info          Dump model info and exit\n");
         printf("  --list          List all tensors and exit\n");
-        printf("  -n <num>        Max tokens to generate (default 50)\n");
+        printf("  --clean         Suppress non-essential output\n");
+        printf("  --no-eos-stop   Do not stop on EOS token\n");
+        printf("  --raw-tokens    Print token IDs instead of text\n");
+        printf("  --chat          Wrap prompt in chat template\n");
+        printf("  -f <file>       Read prompt from file\n");
+        printf("  -n <num>        Max tokens to generate (default 64)\n");
         printf("  -t <temp>       Temperature, 0=argmax (default 0.8)\n");
         printf("  -s <seed>       Random seed (default time)\n");
         printf("  --prompt <s>    Prompt string\n");
@@ -1542,14 +2021,29 @@ int main(int argc, char **argv) {
         printf("  --hidden <n>    Override hidden dim\n");
         printf("  --seq <n>       Override max sequence length\n");
         printf("  --top-k <n>     Top-k sampling, 0=disabled (default 40)\n");
-        printf("  --eos <id>      EOS token ID (default 2 for SmoLLM2)\n");
-        printf("  --chat          Wrap prompt in chat template\n");
+        printf("  --top-p <p>     Top-p sampling (not yet implemented)\n");
+        printf("  --eos <id>      EOS token ID (default 2)\n");
+        printf("  --repeat-penalty <p>  Repetition penalty (default 1.15)\n");
+        printf("  --no-embed-cache     Skip embedding f32 cache (saves RAM, slower)\n");
+        printf("  --threads <n>        Parallel threads for large matmul (WinNT only, default 1)\n");
         return 1;
     }
 
+    memset(&m, 0, sizeof(Model));
+    m.repeat_penalty = 1.15f;
+
     model_path = argv[1];
     for (arg = 2; arg < argc; arg++) {
-        if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); arg++; }
+        if (strcmp(argv[arg], "--info") == 0) { do_info = 1; }
+        else if (strcmp(argv[arg], "--clean") == 0) { g_clean_output = 1; }
+        else if (strcmp(argv[arg], "--no-eos-stop") == 0) { no_eos_stop = 1; }
+        else if (strcmp(argv[arg], "--raw-tokens") == 0) { do_raw_tokens = 1; }
+        else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
+        else if (strcmp(argv[arg], "--no-embed-cache") == 0) { g_no_embed_cache = 1; }
+        else if (strcmp(argv[arg], "--threads") == 0 && arg + 1 < argc) { g_n_threads = atoi(argv[arg+1]); if (g_n_threads < 1) g_n_threads = 1; arg++; }
+        else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
+        else if (strcmp(argv[arg], "-f") == 0 && arg + 1 < argc) { prompt_file = argv[arg+1]; arg++; }
+        else if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "-t") == 0 && arg + 1 < argc) { temp = (float)atof(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "-s") == 0 && arg + 1 < argc) { seed = (unsigned int)atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--prompt") == 0 && arg + 1 < argc) { prompt = argv[arg+1]; arg++; }
@@ -1559,15 +2053,18 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--hidden") == 0 && arg + 1 < argc) { hidden_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--seq") == 0 && arg + 1 < argc) { seq_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--top-k") == 0 && arg + 1 < argc) { top_k = atoi(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "--top-p") == 0 && arg + 1 < argc) { top_p = (float)atof(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--eos") == 0 && arg + 1 < argc) { eos_token = atoi(argv[arg+1]); arg++; }
-        else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
-        else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
+        else if (strcmp(argv[arg], "--repeat-penalty") == 0 && arg + 1 < argc) { m.repeat_penalty = (float)atof(argv[arg+1]); arg++; }
     }
 
     if (seed == 0) seed = (unsigned int)time(NULL);
     srand(seed);
 
-    printf("gguf_infer v5 (packfix+chat+eos=%d)\n", eos_token);
+    if (!g_clean_output) {
+        printf("gguf_infer v6 (multi-arch + sorted tokenizer)\n");
+    }
+
     ctx = gguf_load(model_path);
     if (!ctx) return 1;
 
@@ -1577,10 +2074,39 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (do_info) {
+        printf("GGUF file: %s\n", model_path);
+        printf("  Version: 3\n");
+        printf("  Tensors: %u\n", (unsigned int)ctx->n_tensors);
+        printf("  Metadata keys: (parsed)\n");
+        printf("  Architecture: %s\n", ctx->hp.architecture);
+        printf("  Context length: %u\n", (unsigned int)ctx->hp.context_length);
+        printf("  Embedding length: %u\n", (unsigned int)ctx->hp.embedding_length);
+        printf("  Block count: %u\n", (unsigned int)ctx->hp.block_count);
+        printf("  Head count: %u\n", (unsigned int)ctx->hp.attention_head_count);
+        printf("  KV head count: %u\n", (unsigned int)ctx->hp.attention_head_count_kv);
+        printf("  FFN length: %u\n", (unsigned int)ctx->hp.feed_forward_length);
+        gguf_free(ctx);
+        return 0;
+    }
+
     hp = ctx->hp;
 
     if (tok_path && tok_path[0]) load_tokenizer(tok_path);
     if (!g_vocab) load_tokenizer_from_gguf(ctx);
+
+    {
+        int est_dim = (int)hp.embedding_length;
+        int est_layers = (int)hp.block_count;
+        int est_hidden = (int)hp.feed_forward_length;
+        int est_seq = seq_user ? seq_user : ((int)hp.context_length ? (int)hp.context_length : 512);
+        unsigned int file_mb = (unsigned int)(ctx->size / (1024*1024));
+        unsigned int cache_kb = (unsigned int)((u64)est_layers * (2 * est_dim * est_dim + est_dim * est_hidden) * 4 / 1024);
+        unsigned int state_kb = (unsigned int)((u64)est_seq * est_dim * 2 * 4 / 1024);
+        printf("Estimated memory: file=%uMB + layer_caches=%uKB + run_state=%uKB (plus embedding cache ~100MB for 50K vocab)\n",
+               file_mb, cache_kb, state_kb);
+        printf("Total RAM needed: ~%u MB + embedding cache\n", file_mb + cache_kb/1024 + state_kb/1024 + 50);
+    }
 
     if (build_model(ctx, &m, &hp, n_heads_user, n_kv_user, hidden_user, seq_user) != 0) {
         gguf_free(ctx);
@@ -1593,6 +2119,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Load prompt from file if requested */
+    if (prompt_file) {
+        FILE *fp = fopen(prompt_file, "rb");
+        if (fp) {
+            static char file_buf[8192];
+            size_t r = fread(file_buf, 1, sizeof(file_buf)-1, fp);
+            file_buf[r] = '\0';
+            prompt = file_buf;
+            fclose(fp);
+        }
+    }
+
     /* Scan special tokens */
     scan_special_tokens();
 
@@ -1600,9 +2138,9 @@ int main(int argc, char **argv) {
 
     /* Build prompt tokens */
     if (do_chat) {
-        /* ChatML format: <|im_start|>user\nPROMPT\n<|im_end|>\n<|im_start|>assistant\n */
+        /* ChatML format: <|im_start|>user\nPROMPT\nproprio\n<|im_start|>assistant\n */
         int tok_im_start = find_special_token("<|im_start|>");
-        int tok_im_end = find_special_token("<|im_end|>");
+        int tok_im_end = find_special_token("proprio");
         int n = 0;
         int tmp_tok[256];
         int tmp_n;
@@ -1610,7 +2148,9 @@ int main(int argc, char **argv) {
         if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
         if (tok_im_end < 0) tok_im_end = find_special_token("</s>");  /* fallback to EOS */
 
-        printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+        if (!g_clean_output) {
+            printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+        }
 
         /* <|im_start|> */
         if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
@@ -1627,7 +2167,7 @@ int main(int argc, char **argv) {
         tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
         for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
 
-        /* <|im_end|> or </s> */
+        /*  =2 */
         if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
 
         /* "\n" */
@@ -1647,40 +2187,73 @@ int main(int argc, char **argv) {
     }
 
     /* Debug: show first 30 prompt tokens */
-    printf("Prompt tokens (%d): ", prompt_len);
-    for (i = 0; i < prompt_len && i < 30; i++) {
-        printf("[%d]", prompt_tokens[i]);
-        if (g_vocab && prompt_tokens[i] >= 0 && prompt_tokens[i] < g_vocab_n) {
-            int tlen = g_vocab[prompt_tokens[i]].len;
-            if (tlen > 0 && tlen < 20) {
-                printf("'");
-                fwrite(g_vocab[prompt_tokens[i]].text, 1, tlen, stdout);
-                printf("' ");
+    if (!g_clean_output) {
+        printf("Prompt tokens (%d): ", prompt_len);
+        for (i = 0; i < prompt_len && i < 30; i++) {
+            printf("[%d]", prompt_tokens[i]);
+            if (g_vocab && prompt_tokens[i] >= 0 && prompt_tokens[i] < g_vocab_n) {
+                int tlen = g_vocab[prompt_tokens[i]].len;
+                if (tlen > 0 && tlen < 20) {
+                    printf("'");
+                    fwrite(g_vocab[prompt_tokens[i]].text, 1, tlen, stdout);
+                    printf("' ");
+                }
             }
         }
+        printf("\n");
     }
-    printf("\n");
 
     /* Process prompt tokens silently to fill KV cache */
-    for (pos = 0; pos < prompt_len; pos++) {
-        next_token = forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0);
+    if (prompt_len > 1 && !g_clean_output) {
+        printf("Prefill %d tokens...", prompt_len);
+        fflush(stdout);
+    }
+    for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
+        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0);
+        if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
+            printf(".");
+            fflush(stdout);
+        }
     }
 
-    /* Generation: stream words with repetition penalty */
+    /* Last prompt token produces first generated token using sampling */
+    if (prompt_len > 1 && !g_clean_output) printf("\n");
+    if (prompt_len > 0) {
+        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, NULL, 0);
+        pos = prompt_len;
+    } else {
+        /* Empty prompt: use BOS token as seed */
+        next_token = forward(&m, &s, 1, 0, temp, top_k, NULL, 0);
+        pos = 1;
+    }
+
+    /* Generation: stream tokens */
     {
         int *last_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
         int n_last = 0;
         int printed = 0;
-        for (i = 0; i < n_generate; i++) {
+        /* Print first generated token immediately */
+        if (next_token != 0 && (no_eos_stop || next_token != eos_token)) {
+            if (do_raw_tokens) {
+                printf("[%d]", next_token);
+            } else {
+                detokenize(next_token, m.vocab_size);
+            }
+            fflush(stdout);
+            if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
+            printed++;
+        }
+        for (i = 1; i < n_generate; i++) {
             if (pos >= m.max_seq_len) break;
             next_token = forward(&m, &s, next_token, pos, temp, top_k, last_tokens, n_last);
             pos++;
-            if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
-            /* Break on configured EOS token or PAD */
-            if (next_token == 0 || next_token == eos_token) {
-                break;
+            if (next_token == 0 || (!no_eos_stop && next_token == eos_token)) break;
+            if (do_raw_tokens) {
+                printf("[%d]", next_token);
+            } else {
+                detokenize(next_token, m.vocab_size);
             }
-            detokenize(next_token, m.vocab_size);
+            if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
             printed++;
             fflush(stdout);
         }
@@ -1693,5 +2266,6 @@ int main(int argc, char **argv) {
     free_model(&m);
     gguf_free(ctx);
     if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
+    if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
     return 0;
 }
