@@ -10,11 +10,17 @@
 #include <string.h>
 #include <math.h>
 #include <windows.h>
+#include <process.h>
 #include <time.h>
+#include <ctype.h>
 
 /* --- Types --- */
 
+#ifdef _MSC_VER
 typedef unsigned __int64 u64;
+#else
+typedef unsigned long long u64;
+#endif
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
@@ -97,12 +103,10 @@ typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len, head_dim;
     float norm_eps, rope_theta, rsqrt_head_dim;
     int tok_embd_transposed; /* 1 if token_embd.weight is [dim, vocab] instead of [vocab, dim] */
-    float *cached_embd;      /* dequantized embeddings [vocab_size][dim], NULL if not cached */
+    float *cached_embd;      /* exact f32 cache for transposed token embeddings/output */
+    float *cached_output;    /* exact f32 cache for transposed output head */
     float *rope_cos;         /* precomputed RoPE cos table [max_seq_len][head_dim/2] */
     float *rope_sin;         /* precomputed RoPE sin table [max_seq_len][head_dim/2] */
-    float **cached_attn_k;   /* per-layer dequantized attn_k, NULL if not cached */
-    float **cached_attn_v;   /* per-layer dequantized attn_v, NULL if not cached */
-    float **cached_ffn_down; /* per-layer dequantized ffn_down, NULL if not cached */
     Tensor *tok_embd;
     Tensor *output_norm;
     Tensor *output;
@@ -134,8 +138,24 @@ static TokenEntry *g_vocab = NULL;
 static int g_vocab_n = 0;
 static u8 *g_tok_buf = NULL;
 static int g_clean_output = 0;
-static int g_no_embed_cache = 0;
-static int g_n_threads = 1;
+static int g_n_threads = 0;
+
+static int contains_nocase(const char *haystack, const char *needle) {
+    size_t nlen, i;
+    if (!haystack || !needle) return 0;
+    nlen = strlen(needle);
+    if (nlen == 0) return 1;
+    for (; *haystack; haystack++) {
+        for (i = 0; i < nlen; i++) {
+            unsigned char hc = (unsigned char)haystack[i];
+            unsigned char nc = (unsigned char)needle[i];
+            if (!hc) break;
+            if (tolower(hc) != tolower(nc)) break;
+        }
+        if (i == nlen) return 1;
+    }
+    return 0;
+}
 
 /* --- GGUF I/O --- */
 
@@ -557,14 +577,21 @@ static float silu(float x) {
 
 /* llama.cpp-style top-k + temperature sampling */
 #define MAX_TOPK 256
-static int sample_topk(float *logits, int n, float temp, int top_k) {
+static int sample_topk(float *logits, int n, float temp, int top_k, int ban_token) {
     int i, k;
     float maxv, sum, r, cdf;
+    if (ban_token >= 0 && ban_token < n) logits[ban_token] = -1e30f;
+    if (temp == 0.0f) {
+        int best = 0;
+        for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+        return best;
+    }
     /* top-k filtering using arrays (safe for negative logits) */
     if (top_k > 0 && top_k < n) {
         int kk = top_k;
         int top_idx[MAX_TOPK];
         float top_val[MAX_TOPK];
+        float top_prob[MAX_TOPK];
         if (kk > MAX_TOPK) kk = MAX_TOPK;
         for (k = 0; k < kk; k++) {
             top_idx[k] = -1;
@@ -585,25 +612,31 @@ static int sample_topk(float *logits, int n, float temp, int top_k) {
                 }
             }
         }
-        for (i = 0; i < n; i++) logits[i] = -1e30f;
+        maxv = top_val[0] / temp;
+        sum = 0.0f;
         for (k = 0; k < kk; k++) {
-            if (top_idx[k] >= 0) logits[top_idx[k]] = top_val[k];
+            top_prob[k] = fast_exp_table((top_val[k] / temp) - maxv);
+            sum += top_prob[k];
         }
-    }
-    /* Greedy (temp = 0) */
-    if (temp == 0.0f) {
-        int best = 0;
-        for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
-        return best;
+        if (sum <= 0.0f) return top_idx[0] >= 0 ? top_idx[0] : 0;
+        r = ((float)rand() / (float)RAND_MAX) * sum;
+        cdf = 0.0f;
+        for (k = 0; k < kk; k++) {
+            cdf += top_prob[k];
+            if (r < cdf) return top_idx[k];
+        }
+        return top_idx[kk - 1] >= 0 ? top_idx[kk - 1] : 0;
     }
     /* Temperature scaling + softmax */
-    for (i = 0; i < n; i++) logits[i] /= temp;
-    maxv = logits[0];
-    for (i = 1; i < n; i++) if (logits[i] > maxv) maxv = logits[i];
+    maxv = logits[0] / temp;
+    for (i = 1; i < n; i++) {
+        float v = logits[i] / temp;
+        if (v > maxv) maxv = v;
+    }
     sum = 0.0f;
     for (i = 0; i < n; i++) {
         if (logits[i] > -1e20f) {
-            logits[i] = fast_exp_table(logits[i] - maxv);
+            logits[i] = fast_exp_table((logits[i] / temp) - maxv);
             sum += logits[i];
         } else {
             logits[i] = 0.0f;
@@ -614,9 +647,8 @@ static int sample_topk(float *logits, int n, float temp, int top_k) {
         for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
-    for (i = 0; i < n; i++) logits[i] /= sum;
     /* Sample from distribution */
-    r = (float)rand() / (float)RAND_MAX;
+    r = ((float)rand() / (float)RAND_MAX) * sum;
     cdf = 0.0f;
     for (i = 0; i < n; i++) {
         cdf += logits[i];
@@ -647,6 +679,68 @@ static void matvec_f32(const float *w, const float *x, float *y, int n, int d) {
 static float fp16_to_fp32(u16 h);
 static void dequantize_row(const Tensor *t, float *out, int row, int d);
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row);
+
+static int blocks_256(int d) {
+    return (d + 255) / 256;
+}
+
+static int cache_tensor_f32_inplace(Tensor *t) {
+    int n, d, i;
+    float *buf;
+    float *row;
+    size_t bytes;
+
+    if (!t || t->type == 0) return 1;
+    n = (int)t->dims[0];
+    d = (int)t->dims[1];
+    if (n <= 0 || d <= 0) return 0;
+    bytes = (size_t)n * (size_t)d * sizeof(float);
+    buf = (float*)malloc(bytes);
+    row = (float*)malloc((size_t)d * sizeof(float));
+    if (!buf || !row) {
+        free(buf);
+        free(row);
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        dequantize_row(t, row, i, d);
+        memcpy(buf + (size_t)i * (size_t)d, row, (size_t)d * sizeof(float));
+    }
+    free(row);
+    t->data = buf;
+    t->type = 0;
+    return 1;
+}
+
+static float *cache_transposed_tensor_f32(const Tensor *t, int rows, int cols) {
+    int i, j;
+    float *buf;
+    float *row;
+    size_t bytes;
+
+    if (!t || rows <= 0 || cols <= 0) return NULL;
+    bytes = (size_t)rows * (size_t)cols * sizeof(float);
+    buf = (float*)malloc(bytes);
+    row = (float*)malloc((size_t)cols * sizeof(float));
+    if (!buf || !row) {
+        free(buf);
+        free(row);
+        return NULL;
+    }
+    for (i = 0; i < rows; i++) {
+        for (j = 0; j < cols; j++) {
+            buf[(size_t)j * (size_t)rows + (size_t)i] = 0.0f;
+        }
+    }
+    for (i = 0; i < rows; i++) {
+        dequantize_row(t, row, i, cols);
+        for (j = 0; j < cols; j++) {
+            buf[(size_t)j * (size_t)rows + (size_t)i] = row[j];
+        }
+    }
+    free(row);
+    return buf;
+}
 
 static void matvec_q4(const BlockQ4 *w, const float *x, float *y, int n, int d) {
     int nb = d / 32;
@@ -803,11 +897,13 @@ static void matvec_q5_1(const BlockQ5_1 *w, const float *x, float *y, int n, int
 }
 
 static void matvec_q4k(const BlockQ4K *w, const float *x, float *y, int n, int d) {
-    int nb = d / 256;
+    int nb = blocks_256(d);
     int i, b, jj, l;
     for (i = 0; i < n; i++) {
         float sum = 0.0f;
         for (b = 0; b < nb; b++) {
+            int base = b * 256;
+            int limit = d - base;
             const BlockQ4K *blk = &w[i * nb + b];
             float d_all = fp16_to_fp32(blk->d[0]);
             float min_all = fp16_to_fp32(blk->d[1]);
@@ -815,19 +911,27 @@ static void matvec_q4k(const BlockQ4K *w, const float *x, float *y, int n, int d
             int is = 0;
             u8 sc, m;
             float d1, m1, d2, m2;
-            const float *xb = x + b * 256;
-            for (jj = 0; jj < 256; jj += 64) {
+            const float *xb = x + base;
+            if (limit > 256) limit = 256;
+            if (limit <= 0) continue;
+            for (jj = 0; jj < limit; jj += 64) {
+                int rem = limit - jj;
                 get_scale_min_k4(is + 0, blk->scales, &sc, &m);
                 d1 = d_all * sc;
                 m1 = min_all * m;
                 get_scale_min_k4(is + 1, blk->scales, &sc, &m);
                 d2 = d_all * sc;
                 m2 = min_all * m;
-                for (l = 0; l < 32; l++) {
+                if (rem > 64) rem = 64;
+                for (l = 0; l < 32 && l < rem; l++) {
                     sum += (d1 * (q[l] & 0xF) - m1) * xb[jj + l];
                 }
-                for (l = 0; l < 32; l++) {
-                    sum += (d2 * (q[l] >> 4) - m2) * xb[jj + 32 + l];
+                if (rem > 32) {
+                    int rem2 = rem - 32;
+                    if (rem2 > 32) rem2 = 32;
+                    for (l = 0; l < rem2; l++) {
+                        sum += (d2 * (q[l] >> 4) - m2) * xb[jj + 32 + l];
+                    }
                 }
                 q += 32;
                 is += 2;
@@ -838,11 +942,13 @@ static void matvec_q4k(const BlockQ4K *w, const float *x, float *y, int n, int d
 }
 
 static void matvec_q5k(const BlockQ5K *w, const float *x, float *y, int n, int d) {
-    int nb = d / 256;
+    int nb = blocks_256(d);
     int i, b, jj, l;
     for (i = 0; i < n; i++) {
         float sum = 0.0f;
         for (b = 0; b < nb; b++) {
+            int base = b * 256;
+            int limit = d - base;
             const BlockQ5K *blk = &w[i * nb + b];
             float d_all = fp16_to_fp32(blk->d[0]);
             float min_all = fp16_to_fp32(blk->d[1]);
@@ -852,19 +958,25 @@ static void matvec_q5k(const BlockQ5K *w, const float *x, float *y, int n, int d
             u8 sc, m;
             u8 u1 = 1, u2 = 2;
             float d1, m1, d2, m2;
-            const float *xb = x + b * 256;
-            for (jj = 0; jj < 256; jj += 64) {
+            const float *xb = x + base;
+            if (limit > 256) limit = 256;
+            if (limit <= 0) continue;
+            for (jj = 0; jj < limit; jj += 64) {
+                int rem = limit - jj;
                 get_scale_min_k4(is + 0, blk->scales, &sc, &m);
                 d1 = d_all * sc;
                 m1 = min_all * m;
                 get_scale_min_k4(is + 1, blk->scales, &sc, &m);
                 d2 = d_all * sc;
                 m2 = min_all * m;
-                for (l = 0; l < 32; l++) {
+                if (rem > 64) rem = 64;
+                for (l = 0; l < 32 && l < rem; l++) {
                     int x0 = (ql[l] & 0x0F) + (qh[l] & u1 ? 16 : 0);
                     int x1 = (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0);
-                    sum += (d1 * (float)x0 - m1) * xb[jj + l + 0]
-                         + (d2 * (float)x1 - m2) * xb[jj + l + 32];
+                    sum += (d1 * (float)x0 - m1) * xb[jj + l + 0];
+                    if (l + 32 < rem) {
+                        sum += (d2 * (float)x1 - m2) * xb[jj + l + 32];
+                    }
                 }
                 ql += 32; is += 2;
                 u1 <<= 2; u2 <<= 2;
@@ -875,28 +987,34 @@ static void matvec_q5k(const BlockQ5K *w, const float *x, float *y, int n, int d
 }
 
 static void matvec_q6k(const BlockQ6K *w, const float *x, float *y, int n, int d) {
-    int nb = d / 256;
+    int nb = blocks_256(d);
     int i, b, n2, l;
     for (i = 0; i < n; i++) {
         float sum = 0.0f;
         for (b = 0; b < nb; b++) {
+            int base = b * 256;
+            int limit = d - base;
             const BlockQ6K *blk = &w[i * nb + b];
             float d_all = fp16_to_fp32(blk->d);
             const u8 *ql = blk->ql;
             const u8 *qh = blk->qh;
             const s8 *sc = blk->scales;
-            const float *xb = x + b * 256;
-            for (n2 = 0; n2 < 256; n2 += 128) {
-                for (l = 0; l < 32; l++) {
+            const float *xb = x + base;
+            if (limit > 256) limit = 256;
+            if (limit <= 0) continue;
+            for (n2 = 0; n2 < limit; n2 += 128) {
+                int rem = limit - n2;
+                if (rem > 128) rem = 128;
+                for (l = 0; l < 32 && l < rem; l++) {
                     int is = l / 16;
                     int q1 = (int)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
                     int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int q3 = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                     int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    sum += d_all * (float)sc[is + 0] * (float)q1 * xb[l + 0];
-                    sum += d_all * (float)sc[is + 2] * (float)q2 * xb[l + 32];
-                    sum += d_all * (float)sc[is + 4] * (float)q3 * xb[l + 64];
-                    sum += d_all * (float)sc[is + 6] * (float)q4 * xb[l + 96];
+                    if (l + 0 < rem) sum += d_all * (float)sc[is + 0] * (float)q1 * xb[l + 0];
+                    if (l + 32 < rem) sum += d_all * (float)sc[is + 2] * (float)q2 * xb[l + 32];
+                    if (l + 64 < rem) sum += d_all * (float)sc[is + 4] * (float)q3 * xb[l + 64];
+                    if (l + 96 < rem) sum += d_all * (float)sc[is + 6] * (float)q4 * xb[l + 96];
                 }
                 xb += 128;
                 ql += 64;
@@ -918,6 +1036,35 @@ static int is_winnt(void) {
 #endif
 }
 
+static int default_thread_count(void) {
+#ifdef _WIN32
+    DWORD_PTR processMask = 0, systemMask = 0;
+    int n = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask)) {
+        while (processMask) {
+            n += (int)(processMask & 1);
+            processMask >>= 1;
+        }
+        if (n > 0) {
+            if (n > 8) n = 8;
+            return n;
+        }
+    }
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        if (si.dwNumberOfProcessors > 0) {
+            n = (int)si.dwNumberOfProcessors;
+            if (n > 8) n = 8;
+            return n;
+        }
+    }
+#endif
+    return 1;
+}
+
+static int blocks_256(int d);
+
 static size_t tensor_row_bytes(const Tensor *t, int d) {
     switch (t->type) {
         case 0: return (size_t)d * sizeof(float);
@@ -926,14 +1073,16 @@ static size_t tensor_row_bytes(const Tensor *t, int d) {
         case 6: return (size_t)(d / 32) * sizeof(BlockQ5_0);
         case 7: return (size_t)(d / 32) * sizeof(BlockQ5_1);
         case 8: return (size_t)(d / 32) * sizeof(BlockQ8);
-        case 12: return (size_t)(d / 256) * sizeof(BlockQ4K);
-        case 13: return (size_t)(d / 256) * sizeof(BlockQ5K);
-        case 14: return (size_t)(d / 256) * sizeof(BlockQ6K);
+        case 12: return (size_t)blocks_256(d) * sizeof(BlockQ4K);
+        case 13: return (size_t)blocks_256(d) * sizeof(BlockQ5K);
+        case 14: return (size_t)blocks_256(d) * sizeof(BlockQ6K);
         default: return 0;
     }
 }
 
 #ifdef _WIN32
+static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row);
+
 typedef struct {
     Tensor sub_t;
     const float *x;
@@ -942,9 +1091,95 @@ typedef struct {
     int d;
 } MatvecThreadWork;
 
-static DWORD WINAPI matvec_thread_func(LPVOID arg) {
+static unsigned __stdcall matvec_thread_func(void *arg) {
     MatvecThreadWork *w = (MatvecThreadWork*)arg;
-    matvec(&w->sub_t, w->x, w->y, w->n, w->d, NULL);
+    matvec_no_parallel(&w->sub_t, w->x, w->y, w->n, w->d, NULL);
+    return 0;
+}
+
+static int file_exists(const char *path) {
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+#endif
+}
+
+static void dirname_from_path(const char *path, char *dir, size_t dir_size) {
+    size_t len;
+    const char *last_slash = strrchr(path, '\\');
+    const char *last_fwd = strrchr(path, '/');
+    const char *cut = last_slash;
+    if (!cut || (last_fwd && last_fwd > cut)) cut = last_fwd;
+    if (!cut) {
+        if (dir_size > 0) dir[0] = '\0';
+        return;
+    }
+    len = (size_t)(cut - path + 1);
+    if (len >= dir_size) len = dir_size - 1;
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+}
+
+static int discover_tokenizer_path(const char *model_path, char *out_path, size_t out_size) {
+    char dir[512];
+    char stem[512];
+    const char *base;
+    const char *dot;
+    const char *candidates[4];
+    int i;
+
+    if (!model_path || !out_path || out_size == 0) return 0;
+    dirname_from_path(model_path, dir, sizeof(dir));
+    base = strrchr(model_path, '\\');
+    if (!base) base = strrchr(model_path, '/');
+    base = base ? base + 1 : model_path;
+    dot = strrchr(base, '.');
+    if (dot) {
+        size_t stem_len = (size_t)(dot - base);
+        if (stem_len >= sizeof(stem)) stem_len = sizeof(stem) - 1;
+        memcpy(stem, base, stem_len);
+        stem[stem_len] = '\0';
+    } else {
+        strncpy(stem, base, sizeof(stem) - 1);
+        stem[sizeof(stem) - 1] = '\0';
+    }
+
+    candidates[0] = "tokenizer.bin";
+    candidates[1] = "tokenizer.ggml.bin";
+    candidates[2] = NULL;
+    candidates[3] = NULL;
+
+    for (i = 0; candidates[i]; i++) {
+        char path[768];
+        sprintf(path, "%s%s", dir, candidates[i]);
+        if (file_exists(path)) {
+            strncpy(out_path, path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+    }
+
+    {
+        char path[768];
+        sprintf(path, "%s%s.tokenizer.bin", dir, stem);
+        if (file_exists(path)) {
+            strncpy(out_path, path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+        sprintf(path, "%s%s.bin", dir, stem);
+        if (file_exists(path)) {
+            strncpy(out_path, path, out_size - 1);
+            out_path[out_size - 1] = '\0';
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -957,7 +1192,7 @@ typedef struct {
     int vocab_size;
 } TransposedOutputThreadWork;
 
-static DWORD WINAPI transposed_output_thread(LPVOID arg) {
+static unsigned __stdcall transposed_output_thread(void *arg) {
     TransposedOutputThreadWork *w = (TransposedOutputThreadWork*)arg;
     int d2, v;
     float *dq_row = (float*)malloc(w->vocab_size * sizeof(float));
@@ -972,72 +1207,211 @@ static DWORD WINAPI transposed_output_thread(LPVOID arg) {
     free(dq_row);
     return 0;
 }
+
+typedef struct {
+    const Tensor *t;
+    float *x;
+    int token;
+    int start_d;
+    int end_d;
+    int vocab_size;
+} TransposedEmbedThreadWork;
+
+static unsigned __stdcall transposed_embed_thread(void *arg) {
+    TransposedEmbedThreadWork *w = (TransposedEmbedThreadWork*)arg;
+    int d2;
+    float *dq_row = (float*)malloc((size_t)w->vocab_size * sizeof(float));
+    if (!dq_row) return 1;
+    for (d2 = w->start_d; d2 < w->end_d; d2++) {
+        dequantize_row(w->t, dq_row, d2, w->vocab_size);
+        w->x[d2] = dq_row[w->token];
+    }
+    free(dq_row);
+    return 0;
+}
+
+static void matvec_transposed_parallel(const Tensor *t, const float *x, float *y, int n, int d) {
+    static int announced = 0;
+    int thread_count = g_n_threads;
+    int i;
+    int failed = 0;
+    float *partials[16];
+    HANDLE threads[16];
+    DWORD tids[16];
+    TransposedOutputThreadWork work[16];
+
+    if (thread_count > 8) thread_count = 8;
+    if (thread_count > d) thread_count = d;
+    if (thread_count < 2) {
+        float *dq_row = (float*)malloc((size_t)n * sizeof(float));
+        int j, v;
+        if (!dq_row) {
+            memset(y, 0, (size_t)n * sizeof(float));
+            return;
+        }
+        memset(y, 0, (size_t)n * sizeof(float));
+        for (j = 0; j < d; j++) {
+            dequantize_row(t, dq_row, j, n);
+            for (v = 0; v < n; v++) y[v] += x[j] * dq_row[v];
+        }
+        free(dq_row);
+        return;
+    }
+
+    if (!announced && !g_clean_output) {
+        printf("Transposed parallel: %s n=%d d=%d threads=%d\n", t->name, n, d, thread_count);
+        fflush(stdout);
+        announced = 1;
+    }
+
+    memset(partials, 0, sizeof(partials));
+    memset(threads, 0, sizeof(threads));
+    memset(work, 0, sizeof(work));
+    memset(tids, 0, sizeof(tids));
+    for (i = 0; i < thread_count; i++) {
+        int start = (int)(((u64)d * (u64)i) / (u64)thread_count);
+        int end = (int)(((u64)d * (u64)(i + 1)) / (u64)thread_count);
+        threads[i] = NULL;
+        partials[i] = (float*)calloc((size_t)n, sizeof(float));
+        if (!partials[i]) {
+            failed = 1;
+            break;
+        }
+        work[i].t = t;
+        work[i].x = x;
+        work[i].partial = partials[i];
+        work[i].start_d = start;
+        work[i].end_d = end;
+        work[i].vocab_size = n;
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, transposed_output_thread, &work[i], 0, &tids[i]);
+        if (!threads[i]) {
+            failed = 1;
+            break;
+        }
+    }
+
+    if (!failed) {
+        int v;
+        memset(y, 0, (size_t)n * sizeof(float));
+        for (i = 0; i < thread_count; i++) {
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+            for (v = 0; v < n; v++) y[v] += partials[i][v];
+            free(partials[i]);
+        }
+        return;
+    }
+
+    for (i = 0; i < thread_count; i++) {
+        if (threads[i]) {
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+        }
+        if (partials[i]) free(partials[i]);
+    }
+    {
+        float *dq_row = (float*)malloc((size_t)n * sizeof(float));
+        int j, v;
+        if (!dq_row) {
+            memset(y, 0, (size_t)n * sizeof(float));
+            return;
+        }
+        memset(y, 0, (size_t)n * sizeof(float));
+        for (j = 0; j < d; j++) {
+            dequantize_row(t, dq_row, j, n);
+            for (v = 0; v < n; v++) y[v] += x[j] * dq_row[v];
+        }
+        free(dq_row);
+    }
+}
+
 #endif
 
 static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, int d) {
 #ifdef _WIN32
+    static int announced = 0;
     size_t row_bytes;
-    int mid;
-    HANDLE threads[2];
-    MatvecThreadWork work[2];
-    DWORD tid0, tid1;
+    int thread_count;
+    int i;
+    int failed;
+    HANDLE threads[16];
+    MatvecThreadWork work[16];
+    DWORD tids[16];
 
     if (g_n_threads < 2 || !is_winnt()) {
-        matvec(t, x, y, n, d, NULL);
+        matvec_no_parallel(t, x, y, n, d, NULL);
         return;
     }
 
     /* Only parallelize standard row-major non-transposed matrices */
     if (!((int)t->dims[0] == n && (int)t->dims[1] == d)) {
-        matvec(t, x, y, n, d, NULL);
+        matvec_no_parallel(t, x, y, n, d, NULL);
         return;
     }
 
     row_bytes = tensor_row_bytes(t, d);
     if (row_bytes == 0) {
-        matvec(t, x, y, n, d, NULL);
+        matvec_no_parallel(t, x, y, n, d, NULL);
         return;
     }
 
-    mid = n / 2;
-    if (mid == 0) {
-        matvec(t, x, y, n, d, NULL);
+    thread_count = g_n_threads;
+    if (thread_count > 8) thread_count = 8;
+    if (thread_count > n) thread_count = n;
+    if (thread_count < 2) {
+        matvec_no_parallel(t, x, y, n, d, NULL);
         return;
     }
 
-    /* Work 0: rows [0, mid) */
-    work[0].sub_t = *t;
-    work[0].sub_t.data = t->data;
-    work[0].sub_t.dims[0] = (u64)mid;
-    work[0].x = x;
-    work[0].y = y;
-    work[0].n = mid;
-    work[0].d = d;
+    if (!announced && !g_clean_output) {
+        printf("Row parallel: %s n=%d d=%d threads=%d\n", t->name, n, d, thread_count);
+        fflush(stdout);
+        announced = 1;
+    }
 
-    /* Work 1: rows [mid, n) */
-    work[1].sub_t = *t;
-    work[1].sub_t.data = (u8*)t->data + (size_t)mid * row_bytes;
-    work[1].sub_t.dims[0] = (u64)(n - mid);
-    work[1].x = x;
-    work[1].y = y + mid;
-    work[1].n = n - mid;
-    work[1].d = d;
+    memset(threads, 0, sizeof(threads));
+    memset(work, 0, sizeof(work));
+    memset(tids, 0, sizeof(tids));
+    failed = 0;
+    for (i = 0; i < thread_count; i++) {
+        int start = (int)(((u64)n * (u64)i) / (u64)thread_count);
+        int end = (int)(((u64)n * (u64)(i + 1)) / (u64)thread_count);
+        int rows = end - start;
+        threads[i] = NULL;
+        if (rows <= 0) continue;
+        work[i].sub_t = *t;
+        work[i].sub_t.data = (u8*)t->data + (size_t)start * row_bytes;
+        work[i].sub_t.dims[0] = (u64)rows;
+        work[i].x = x;
+        work[i].y = y + start;
+        work[i].n = rows;
+        work[i].d = d;
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, matvec_thread_func, &work[i], 0, &tids[i]);
+        if (!threads[i]) {
+            failed = 1;
+            break;
+        }
+    }
 
-    threads[0] = CreateThread(NULL, 0, matvec_thread_func, &work[0], 0, &tid0);
-    threads[1] = CreateThread(NULL, 0, matvec_thread_func, &work[1], 0, &tid1);
+    if (failed) {
+        for (i = 0; i < thread_count; i++) {
+            if (threads[i]) {
+                WaitForSingleObject(threads[i], INFINITE);
+                CloseHandle(threads[i]);
+            }
+        }
+        matvec_no_parallel(t, x, y, n, d, NULL);
+        return;
+    }
 
-    if (threads[0] && threads[1]) {
-        WaitForMultipleObjects(2, threads, TRUE, INFINITE);
-        CloseHandle(threads[0]);
-        CloseHandle(threads[1]);
-    } else {
-        /* Thread creation failed, fall back to single-threaded */
-        if (threads[0]) CloseHandle(threads[0]);
-        if (threads[1]) CloseHandle(threads[1]);
-        matvec(t, x, y, n, d, NULL);
+    for (i = 0; i < thread_count; i++) {
+        if (threads[i]) {
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+        }
     }
 #else
-    matvec(t, x, y, n, d, NULL);
+    matvec_no_parallel(t, x, y, n, d, NULL);
 #endif
 }
 
@@ -1112,10 +1486,12 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
             blk++;
         }
     } else if (t->type == 12) {
-        int nb = d / 256;
+        int nb = blocks_256(d);
         const BlockQ4K *blk = (const BlockQ4K*)t->data + row * nb;
         int j;
         for (j = 0; j < d; j += 256) {
+            int limit = d - j;
+            if (limit > 256) limit = 256;
             float d_all = fp16_to_fp32(blk->d[0]);
             float min_all = fp16_to_fp32(blk->d[1]);
             const u8 *q = blk->qs;
@@ -1124,18 +1500,24 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
             int jj;
             float d1, m1, d2, m2;
             int l;
-            for (jj = 0; jj < 256; jj += 64) {
+            for (jj = 0; jj < limit; jj += 64) {
+                int rem = limit - jj;
                 get_scale_min_k4(is + 0, blk->scales, &sc, &m);
                 d1 = d_all * sc;
                 m1 = min_all * m;
                 get_scale_min_k4(is + 1, blk->scales, &sc, &m);
                 d2 = d_all * sc;
                 m2 = min_all * m;
-                for (l = 0; l < 32; l++) {
+                if (rem > 64) rem = 64;
+                for (l = 0; l < 32 && l < rem; l++) {
                     out[j + jj + l] = d1 * (q[l] & 0xF) - m1;
                 }
-                for (l = 0; l < 32; l++) {
-                    out[j + jj + 32 + l] = d2 * (q[l] >> 4) - m2;
+                if (rem > 32) {
+                    int rem2 = rem - 32;
+                    if (rem2 > 32) rem2 = 32;
+                    for (l = 0; l < rem2; l++) {
+                        out[j + jj + 32 + l] = d2 * (q[l] >> 4) - m2;
+                    }
                 }
                 q += 32;
                 is += 2;
@@ -1143,10 +1525,12 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
             blk++;
         }
     } else if (t->type == 13) {
-        int nb = d / 256;
+        int nb = blocks_256(d);
         const BlockQ5K *blk = (const BlockQ5K*)t->data + row * nb;
         int j;
         for (j = 0; j < d; j += 256) {
+            int limit = d - j;
+            if (limit > 256) limit = 256;
             float d_all = fp16_to_fp32(blk->d[0]);
             float min_all = fp16_to_fp32(blk->d[1]);
             const u8 *ql = blk->qs;
@@ -1157,18 +1541,22 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
             int jj;
             float d1, m1, d2, m2;
             int l;
-            for (jj = 0; jj < 256; jj += 64) {
+            for (jj = 0; jj < limit; jj += 64) {
+                int rem = limit - jj;
                 get_scale_min_k4(is + 0, blk->scales, &sc, &m);
                 d1 = d_all * sc;
                 m1 = min_all * m;
                 get_scale_min_k4(is + 1, blk->scales, &sc, &m);
                 d2 = d_all * sc;
                 m2 = min_all * m;
-                for (l = 0; l < 32; l++) {
+                if (rem > 64) rem = 64;
+                for (l = 0; l < 32 && l < rem; l++) {
                     int x0 = (ql[l] & 0x0F) + (qh[l] & u1 ? 16 : 0);
                     int x1 = (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0);
                     out[j + jj + l + 0] = d1 * (float)x0 - m1;
-                    out[j + jj + l + 32] = d2 * (float)x1 - m2;
+                    if (l + 32 < rem) {
+                        out[j + jj + l + 32] = d2 * (float)x1 - m2;
+                    }
                 }
                 ql += 32; is += 2;
                 u1 <<= 2; u2 <<= 2;
@@ -1176,28 +1564,32 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
             blk++;
         }
     } else if (t->type == 14) {
-        int nb = d / 256;
+        int nb = blocks_256(d);
         const BlockQ6K *blk = (const BlockQ6K*)t->data + row * nb;
         int j;
         for (j = 0; j < d; j += 256) {
+            int limit = d - j;
+            if (limit > 256) limit = 256;
             const float d_all = fp16_to_fp32(blk->d);
             const u8 *ql = blk->ql;
             const u8 *qh = blk->qh;
             const s8 *sc = blk->scales;
             float *y = out + j;
             int n2;
-            for (n2 = 0; n2 < 256; n2 += 128) {
+            for (n2 = 0; n2 < limit; n2 += 128) {
+                int rem = limit - n2;
                 int l;
-                for (l = 0; l < 32; l++) {
+                if (rem > 128) rem = 128;
+                for (l = 0; l < 32 && l < rem; l++) {
                     int is = l / 16;
                     int q1 = (int)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
                     int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int q3 = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                     int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    y[l + 0]  = d_all * (float)sc[is + 0] * (float)q1;
-                    y[l + 32] = d_all * (float)sc[is + 2] * (float)q2;
-                    y[l + 64] = d_all * (float)sc[is + 4] * (float)q3;
-                    y[l + 96] = d_all * (float)sc[is + 6] * (float)q4;
+                    if (l + 0 < rem)  y[l + 0]  = d_all * (float)sc[is + 0] * (float)q1;
+                    if (l + 32 < rem) y[l + 32] = d_all * (float)sc[is + 2] * (float)q2;
+                    if (l + 64 < rem) y[l + 64] = d_all * (float)sc[is + 4] * (float)q3;
+                    if (l + 96 < rem) y[l + 96] = d_all * (float)sc[is + 6] * (float)q4;
                 }
                 y += 128;
                 ql += 64;
@@ -1223,7 +1615,9 @@ static int effective_seq_limit(int requested, int n_layers, int n_kv_heads, int 
     return limit;
 }
 
-static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
+static void matvec_transposed_parallel(const Tensor *t, const float *x, float *y, int n, int d);
+
+static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
     int i, j;
     /* Transposed tensor fallback: [d, n] instead of [n, d].
        CRITICAL: when n==d (square matrices), we cannot tell orientation.
@@ -1238,12 +1632,6 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
             }
             y[i] = sum;
         }
-        return;
-    }
-    /* Parallelize large non-transposed matrices on WinNT */
-    if (g_n_threads > 1 && n >= 10000 && is_winnt() &&
-        (int)t->dims[0] == n && (int)t->dims[1] == d) {
-        matvec_parallel(t, x, y, n, d);
         return;
     }
     if (t->type == 0) {
@@ -1268,6 +1656,15 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
         fprintf(stderr, "Warning: unsupported type %u for %s, using zeros\n", t->type, t->name);
         memset(y, 0, n * sizeof(float));
     }
+}
+
+static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
+    if (g_n_threads > 1 && n >= 4096 && is_winnt() &&
+        (int)t->dims[0] == n && (int)t->dims[1] == d) {
+        matvec_parallel(t, x, y, n, d);
+        return;
+    }
+    matvec_no_parallel(t, x, y, n, d, dq_row);
 }
 
 /* --- Model builder --- */
@@ -1300,46 +1697,6 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         m->vocab_size = (int)t->dims[0];
         m->dim = (int)t->dims[1];
         m->tok_embd_transposed = 0;
-    }
-
-    /* Pre-dequantize embeddings to f32 cache for fast lookup */
-    if (!g_no_embed_cache && m->tok_embd->type != 0) {
-        int vs = m->vocab_size;
-        int dm = m->dim;
-        int j, tk;
-        size_t cache_bytes = (size_t)vs * dm * sizeof(float);
-        if (cache_bytes > 256U * 1024U * 1024U) {
-            printf("Embedding cache too large (%u MB > 256MB), using slow per-token dequant.\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)));
-            m->cached_embd = NULL;
-        } else {
-            float *tmp = (float*)malloc(vs * sizeof(float));
-            m->cached_embd = (float*)malloc(cache_bytes);
-            if (!tmp || !m->cached_embd) {
-                fprintf(stderr, "Warning: failed to allocate embedding cache, using slow dequant path\n");
-                if (tmp) free(tmp);
-                if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
-            } else {
-                printf("Dequantizing embeddings to f32 cache (%u KB)...\n", (unsigned int)(cache_bytes / 1024));
-                if (m->tok_embd_transposed) {
-                    for (j = 0; j < dm; j++) {
-                        dequantize_row(m->tok_embd, tmp, j, vs);
-                        for (tk = 0; tk < vs; tk++) {
-                            m->cached_embd[tk * dm + j] = tmp[tk];
-                        }
-                    }
-                } else {
-                    for (tk = 0; tk < vs; tk++) {
-                        dequantize_row(m->tok_embd, tmp, tk, dm);
-                        memcpy(m->cached_embd + tk * dm, tmp, dm * sizeof(float));
-                    }
-                }
-                printf("Embedding cache ready.\n");
-                free(tmp);
-            }
-        }
-    } else if (g_no_embed_cache && m->tok_embd->type != 0) {
-        printf("Embedding cache disabled (--no-embed-cache), using slow per-token dequant.\n");
     }
 
     t = find_tensor(ctx, "output_norm.weight");
@@ -1394,6 +1751,21 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         if (t) m->hidden_dim = (int)t->dims[0];
     }
     if (m->hidden_dim == 0) { fprintf(stderr, "Need --hidden (cannot determine)\n"); return 1; }
+
+    if (m->tok_embd_transposed) {
+        size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
+        printf("Caching transposed token embeddings in F32 for speed...\n");
+        m->cached_embd = cache_transposed_tensor_f32(m->tok_embd, m->dim, m->vocab_size);
+        if (!m->cached_embd) {
+            fprintf(stderr, "Failed to allocate embedding cache (%u MB)\n",
+                    (unsigned int)(cache_bytes / (1024U * 1024U)));
+            return 1;
+        }
+        if (m->output == m->tok_embd) {
+            m->cached_output = m->cached_embd;
+        }
+        printf("Embedding cache ready.\n");
+    }
 
     if (seq_user > 0) m->max_seq_len = seq_user;
     else if (hp->context_length > 0) m->max_seq_len = (int)hp->context_length;
@@ -1482,24 +1854,47 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             printf("Warning: layer %d ffn_norm is type %u (expected F32)\n", i, m->ffn_norm[i]->type);
     }
 
-    /* Pre-dequantize heaviest weights to f32 for fast matmul.
-       On low-RAM systems (e.g. WinME with 1.5GB), caching anything
-       beyond the embedding cache is unsafe. attn_k/v are small but
-       cause heap fragmentation; ffn_down is huge. All disabled. */
+    if (!m->cached_output && m->output && m->output != m->tok_embd &&
+        m->output->dims[1] > m->output->dims[0] && m->output->type != 0) {
+        size_t cache_bytes = (size_t)m->output->dims[0] * (size_t)m->output->dims[1] * sizeof(float);
+        printf("Caching transposed output head in F32 for speed...\n");
+        m->cached_output = cache_transposed_tensor_f32(m->output, (int)m->output->dims[0], (int)m->output->dims[1]);
+        if (!m->cached_output) {
+            fprintf(stderr, "Warning: failed to cache output head (%u MB)\n",
+                    (unsigned int)(cache_bytes / (1024U * 1024U)));
+        } else {
+            printf("Output cache ready.\n");
+        }
+    }
+
     {
         int l;
-        m->cached_attn_k = (float**)malloc(sizeof(float*) * m->n_layers);
-        m->cached_attn_v = (float**)malloc(sizeof(float*) * m->n_layers);
-        m->cached_ffn_down = (float**)malloc(sizeof(float*) * m->n_layers);
-        if (!m->cached_attn_k || !m->cached_attn_v || !m->cached_ffn_down) {
-            fprintf(stderr, "Failed to allocate cache pointer arrays (out of memory?)\n");
-            return 1;
-        }
+
+        printf("Caching hot projection weights in F32 for speed...\n");
         for (l = 0; l < m->n_layers; l++) {
-            m->cached_attn_k[l] = NULL;
-            m->cached_attn_v[l] = NULL;
-            m->cached_ffn_down[l] = NULL;
+            if (m->attn_q[l] && m->attn_q[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->attn_q[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->attn_q[l]->name);
+            }
+            if (m->attn_k[l] && m->attn_k[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->attn_k[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->attn_k[l]->name);
+            }
+            if (m->attn_v[l] && m->attn_v[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->attn_v[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->attn_v[l]->name);
+            }
+            if (m->attn_o[l] && m->attn_o[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->attn_o[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->attn_o[l]->name);
+            }
+            if (m->ffn_gate[l] && m->ffn_gate[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->ffn_gate[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_gate[l]->name);
+            }
+            if (m->ffn_up[l] && m->ffn_up[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->ffn_up[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_up[l]->name);
+            }
+            if (m->ffn_down[l] && m->ffn_down[l]->type != 0) {
+                if (!cache_tensor_f32_inplace(m->ffn_down[l])) fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_down[l]->name);
+            }
         }
+        printf("Hot weights cache pass complete.\n");
     }
 
     /* Diagnostics: verify block sizes and tensor offsets */
@@ -1557,6 +1952,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
 }
 
 static void free_model(Model *m) {
+    if (m->cached_output && m->cached_output != m->cached_embd) { free(m->cached_output); m->cached_output = NULL; }
     if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
     if (m->rope_cos)   { free(m->rope_cos);   m->rope_cos = NULL; }
     if (m->rope_sin)   { free(m->rope_sin);   m->rope_sin = NULL; }
@@ -1638,7 +2034,7 @@ static void free_runstate(RunState *s) {
 
 /* --- Forward pass --- */
 
-static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, int *recent, int recent_n) {
+static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, int *recent, int recent_n, int ban_token) {
     int dim = m->dim;
     int hidden_dim = m->hidden_dim;
     int n_layers = m->n_layers;
@@ -1661,7 +2057,7 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 
     /* Token embedding row lookup */
     if (m->cached_embd) {
-        memcpy(x, m->cached_embd + (size_t)token * dim, dim * sizeof(float));
+        memcpy(x, m->cached_embd + (size_t)token * (size_t)dim, (size_t)dim * sizeof(float));
     } else if (m->tok_embd_transposed) {
         int j;
         for (j = 0; j < dim; j++) {
@@ -1754,60 +2150,31 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
     }
 
     rmsnorm(x, (float*)m->output_norm->data, dim, m->norm_eps);
-    if (m->cached_embd && m->output == m->tok_embd) {
-        /* Fast path: cached f32 embeddings for output projection */
-        matvec_f32(m->cached_embd, x, s->logits, vocab_size, dim);
+    if (m->cached_output) {
+        Tensor fake;
+        fake = *m->output;
+        fake.type = 0;
+        fake.dims[0] = (u64)vocab_size;
+        fake.dims[1] = (u64)dim;
+        fake.data = m->cached_output;
+        matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
+    } else if (m->cached_embd && m->output == m->tok_embd) {
+        Tensor fake;
+        fake = *m->output;
+        fake.type = 0;
+        fake.dims[0] = (u64)vocab_size;
+        fake.dims[1] = (u64)dim;
+        fake.data = m->cached_embd;
+        matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
     } else if (m->tok_embd_transposed && m->output == m->tok_embd) {
-        /* Transposed embedding: W is [dim, vocab], compute logits[v] = sum_d(x[d]*W[d,v]) */
-#ifdef _WIN32
-        if (g_n_threads > 1 && is_winnt() && dim >= 64) {
-            int mid_d = dim / 2;
-            float *partial1 = (float*)calloc(vocab_size, sizeof(float));
-            float *partial2 = (float*)calloc(vocab_size, sizeof(float));
-            TransposedOutputThreadWork work[2];
-            HANDLE threads[2];
-            DWORD tid0, tid1;
-            int v;
-            if (partial1 && partial2) {
-                work[0].t = m->output; work[0].x = x; work[0].partial = partial1;
-                work[0].start_d = 0; work[0].end_d = mid_d; work[0].vocab_size = vocab_size;
-                work[1].t = m->output; work[1].x = x; work[1].partial = partial2;
-                work[1].start_d = mid_d; work[1].end_d = dim; work[1].vocab_size = vocab_size;
-                threads[0] = CreateThread(NULL, 0, transposed_output_thread, &work[0], 0, &tid0);
-                threads[1] = CreateThread(NULL, 0, transposed_output_thread, &work[1], 0, &tid1);
-                if (threads[0] && threads[1]) {
-                    WaitForMultipleObjects(2, threads, TRUE, INFINITE);
-                    CloseHandle(threads[0]);
-                    CloseHandle(threads[1]);
-                    for (v = 0; v < vocab_size; v++) {
-                        s->logits[v] = partial1[v] + partial2[v];
-                    }
-                } else {
-                    if (threads[0]) CloseHandle(threads[0]);
-                    if (threads[1]) CloseHandle(threads[1]);
-                    goto transposed_single;
-                }
-            } else {
-                transposed_single:
-#endif
-                {
-                    int d2, v;
-                    memset(s->logits, 0, vocab_size * sizeof(float));
-                    for (d2 = 0; d2 < dim; d2++) {
-                        dequantize_row(m->output, s->dq_row, d2, vocab_size);
-                        for (v = 0; v < vocab_size; v++) {
-                            s->logits[v] += x[d2] * s->dq_row[v];
-                        }
-                    }
-                }
-#ifdef _WIN32
+        int d2, v;
+        memset(s->logits, 0, vocab_size * sizeof(float));
+        for (d2 = 0; d2 < dim; d2++) {
+            dequantize_row(m->output, s->dq_row, d2, vocab_size);
+            for (v = 0; v < vocab_size; v++) {
+                s->logits[v] += x[d2] * s->dq_row[v];
             }
-            if (partial1) free(partial1);
-            if (partial2) free(partial2);
-        } else {
-            goto transposed_single;
         }
-#endif
     } else {
         matvec(m->output, x, s->logits, vocab_size, dim, s->dq_row);
     }
@@ -1822,7 +2189,7 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
             }
         }
     }
-    return sample_topk(s->logits, vocab_size, temp, top_k);
+    return sample_topk(s->logits, vocab_size, temp, top_k, ban_token);
 }
 
 /* --- Tokenizer --- */
@@ -1837,35 +2204,76 @@ static int load_tokenizer(const char *path) {
     u32 count;
     int i;
     size_t pos;
+    int parsed;
     if (g_tok_buf) { free(g_tok_buf); g_tok_buf = NULL; free(g_vocab); g_vocab = NULL; }
     if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
     f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END); sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 4) { fclose(f); return 0; }
     buf = (u8*)malloc(sz);
-    fread(buf, 1, sz, f); fclose(f);
+    if (!buf) { fclose(f); return 0; }
+    if (fread(buf, 1, sz, f) != sz) { free(buf); fclose(f); return 0; }
+    fclose(f);
     memcpy(&count, buf, 4);
+    if (count == 0) { free(buf); return 0; }
     g_vocab = (TokenEntry*)malloc(sizeof(TokenEntry) * count);
-    g_vocab_n = (int)count;
+    if (!g_vocab) { free(buf); return 0; }
     pos = 4;
+    parsed = 0;
     for (i = 0; i < (int)count && pos < sz; i++) {
         int tlen = (int)buf[pos++];
+        if (pos + (size_t)tlen > sz) break;
         g_vocab[i].len = tlen;
         g_vocab[i].text = (char*)(buf + pos);
         pos += tlen;
+        parsed++;
     }
+    if (parsed <= 0) {
+        free(g_vocab); g_vocab = NULL;
+        free(buf); return 0;
+    }
+    g_vocab_n = parsed;
     g_tok_buf = buf;
     printf("Loaded tokenizer: %d tokens\n", g_vocab_n);
     return 1;
+}
+
+static int load_tokenizer_auto(const char *model_path, const char *tok_path, GGUFContext *ctx) {
+    char found[768];
+
+    if (tok_path && tok_path[0] && strcmp(tok_path, "auto") != 0) {
+        if (load_tokenizer(tok_path)) {
+            printf("Tokenizer source: %s\n", tok_path);
+            return 1;
+        }
+        printf("Warning: failed to load tokenizer file %s\n", tok_path);
+    }
+
+    if (discover_tokenizer_path(model_path, found, sizeof(found))) {
+        if (load_tokenizer(found)) {
+            printf("Tokenizer source: %s\n", found);
+            return 1;
+        }
+        printf("Warning: failed to load discovered tokenizer file %s\n", found);
+    }
+
+    if (load_tokenizer_from_gguf(ctx)) {
+        printf("Tokenizer source: embedded GGUF metadata\n");
+        return 1;
+    }
+
+    printf("Warning: no tokenizer file found; falling back to raw byte tokens\n");
+    return 0;
 }
 
 static void init_sorted_vocab(void) {
     /* Counting sort by token length - O(n) instead of O(n^2) bubble sort.
        Sorts descending by length (longest tokens first for greedy matching). */
     int i;
-    int counts[65];
-    int offsets[65];
-    int cursors[65];
+    int counts[256];
+    int offsets[256];
+    int cursors[256];
     int len;
     if (g_sorted_init || g_vocab_n <= 0) return;
     g_sorted_vocab = (int*)malloc(sizeof(int) * g_vocab_n);
@@ -1873,18 +2281,18 @@ static void init_sorted_vocab(void) {
     memset(counts, 0, sizeof(counts));
     for (i = 0; i < g_vocab_n; i++) {
         len = g_vocab[i].len;
-        if (len > 64) len = 64;
+        if (len > 255) len = 255;
         if (len < 0) len = 0;
         counts[len]++;
     }
-    offsets[64] = 0;
-    for (len = 63; len >= 0; len--) {
+    offsets[255] = 0;
+    for (len = 254; len >= 0; len--) {
         offsets[len] = offsets[len + 1] + counts[len + 1];
     }
     memcpy(cursors, offsets, sizeof(cursors));
     for (i = 0; i < g_vocab_n; i++) {
         len = g_vocab[i].len;
-        if (len > 64) len = 64;
+        if (len > 255) len = 255;
         if (len < 0) len = 0;
         g_sorted_vocab[cursors[len]++] = i;
     }
@@ -1928,6 +2336,16 @@ static int tokenize(const char *text, int *tokens, int max_tokens, int vocab_siz
             pos++;
         }
     }
+    return n;
+}
+
+static int append_text_tokens(int *dst, int cap, int n, const char *text, int vocab_size) {
+    int tmp[256];
+    int tmp_n;
+    int i;
+    if (!dst || !text || cap <= 0 || n >= cap) return n;
+    tmp_n = tokenize(text, tmp, 256, vocab_size);
+    for (i = 0; i < tmp_n && n < cap; i++) dst[n++] = tmp[i];
     return n;
 }
 
@@ -1988,6 +2406,7 @@ int main(int argc, char **argv) {
     int do_info = 0;
     int do_list = 0;
     int do_raw_tokens = 0;
+    int tinyllama_mode = 0;
     int seq_user = 0;
     int n_heads_user = 0;
     int n_kv_user = 0;
@@ -2015,7 +2434,7 @@ int main(int argc, char **argv) {
         printf("  -t <temp>       Temperature, 0=argmax (default 0.8)\n");
         printf("  -s <seed>       Random seed (default time)\n");
         printf("  --prompt <s>    Prompt string\n");
-        printf("  --tok <file>    tokenizer.bin (optional)\n");
+        printf("  --tok <file|auto>   tokenizer.bin or auto-discover\n");
         printf("  --n_heads <n>   Override head count\n");
         printf("  --n_kv <n>      Override KV head count\n");
         printf("  --hidden <n>    Override hidden dim\n");
@@ -2024,8 +2443,7 @@ int main(int argc, char **argv) {
         printf("  --top-p <p>     Top-p sampling (not yet implemented)\n");
         printf("  --eos <id>      EOS token ID (default 2)\n");
         printf("  --repeat-penalty <p>  Repetition penalty (default 1.15)\n");
-        printf("  --no-embed-cache     Skip embedding f32 cache (saves RAM, slower)\n");
-        printf("  --threads <n>        Parallel threads for large matmul (WinNT only, default 1)\n");
+        printf("  --threads <n|auto>   Parallel threads for large matmul (WinNT only, default auto)\n");
         return 1;
     }
 
@@ -2033,14 +2451,18 @@ int main(int argc, char **argv) {
     m.repeat_penalty = 1.15f;
 
     model_path = argv[1];
+    tinyllama_mode = contains_nocase(model_path, "tinyllama");
     for (arg = 2; arg < argc; arg++) {
         if (strcmp(argv[arg], "--info") == 0) { do_info = 1; }
         else if (strcmp(argv[arg], "--clean") == 0) { g_clean_output = 1; }
         else if (strcmp(argv[arg], "--no-eos-stop") == 0) { no_eos_stop = 1; }
         else if (strcmp(argv[arg], "--raw-tokens") == 0) { do_raw_tokens = 1; }
         else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
-        else if (strcmp(argv[arg], "--no-embed-cache") == 0) { g_no_embed_cache = 1; }
-        else if (strcmp(argv[arg], "--threads") == 0 && arg + 1 < argc) { g_n_threads = atoi(argv[arg+1]); if (g_n_threads < 1) g_n_threads = 1; arg++; }
+        else if (strcmp(argv[arg], "--threads") == 0 && arg + 1 < argc) {
+            if (strcmp(argv[arg+1], "auto") == 0 || strcmp(argv[arg+1], "AUTO") == 0) g_n_threads = 0;
+            else g_n_threads = atoi(argv[arg+1]);
+            arg++;
+        }
         else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
         else if (strcmp(argv[arg], "-f") == 0 && arg + 1 < argc) { prompt_file = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); arg++; }
@@ -2058,11 +2480,15 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--repeat-penalty") == 0 && arg + 1 < argc) { m.repeat_penalty = (float)atof(argv[arg+1]); arg++; }
     }
 
+    if (g_n_threads <= 0) g_n_threads = default_thread_count();
+    if (g_n_threads < 1) g_n_threads = 1;
+
     if (seed == 0) seed = (unsigned int)time(NULL);
     srand(seed);
 
     if (!g_clean_output) {
         printf("gguf_infer v6 (multi-arch + sorted tokenizer)\n");
+        printf("Threads: %d\n", g_n_threads);
     }
 
     ctx = gguf_load(model_path);
@@ -2092,8 +2518,7 @@ int main(int argc, char **argv) {
 
     hp = ctx->hp;
 
-    if (tok_path && tok_path[0]) load_tokenizer(tok_path);
-    if (!g_vocab) load_tokenizer_from_gguf(ctx);
+    load_tokenizer_auto(model_path, tok_path, ctx);
 
     {
         int est_dim = (int)hp.embedding_length;
@@ -2103,9 +2528,9 @@ int main(int argc, char **argv) {
         unsigned int file_mb = (unsigned int)(ctx->size / (1024*1024));
         unsigned int cache_kb = (unsigned int)((u64)est_layers * (2 * est_dim * est_dim + est_dim * est_hidden) * 4 / 1024);
         unsigned int state_kb = (unsigned int)((u64)est_seq * est_dim * 2 * 4 / 1024);
-        printf("Estimated memory: file=%uMB + layer_caches=%uKB + run_state=%uKB (plus embedding cache ~100MB for 50K vocab)\n",
+        printf("Estimated memory: file=%uMB + matmul_workspace=%uKB + run_state=%uKB\n",
                file_mb, cache_kb, state_kb);
-        printf("Total RAM needed: ~%u MB + embedding cache\n", file_mb + cache_kb/1024 + state_kb/1024 + 50);
+        printf("Total RAM needed: ~%u MB\n", file_mb + cache_kb/1024 + state_kb/1024);
     }
 
     if (build_model(ctx, &m, &hp, n_heads_user, n_kv_user, hidden_user, seq_user) != 0) {
@@ -2137,49 +2562,57 @@ int main(int argc, char **argv) {
     prompt_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
 
     /* Build prompt tokens */
-    if (do_chat) {
-        /* ChatML format: <|im_start|>user\nPROMPT\nproprio\n<|im_start|>assistant\n */
+    if (do_chat || tinyllama_mode) {
         int tok_im_start = find_special_token("<|im_start|>");
-        int tok_im_end = find_special_token("proprio");
+        int tok_im_end = find_special_token("<|im_end|>");
         int n = 0;
-        int tmp_tok[256];
-        int tmp_n;
 
-        if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
-        if (tok_im_end < 0) tok_im_end = find_special_token("</s>");  /* fallback to EOS */
+        if (tinyllama_mode) {
+            if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n,
+                "<s>[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant.\n<</SYS>>\n\n",
+                m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " [/INST]", m.vocab_size);
+        } else {
+            int tmp_tok[256];
+            int tmp_n;
+            if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
+            if (tok_im_end < 0) tok_im_end = find_special_token("</s>");  /* fallback to EOS */
 
-        if (!g_clean_output) {
-            printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+            if (!g_clean_output) {
+                printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+            }
+
+            /* <|im_start|> */
+            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
+
+            /* "user\n" */
+            tmp_n = tokenize("user\n", tmp_tok, 256, m.vocab_size);
+            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+            /* user prompt */
+            tmp_n = tokenize(prompt, tmp_tok, 256, m.vocab_size);
+            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+            /* "\n" */
+            tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
+            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+            /*  =2 */
+            if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
+
+            /* "\n" */
+            tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
+            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+
+            /* <|im_start|> */
+            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
+
+            /* "assistant\n" */
+            tmp_n = tokenize("assistant\n", tmp_tok, 256, m.vocab_size);
+            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
         }
-
-        /* <|im_start|> */
-        if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-
-        /* "user\n" */
-        tmp_n = tokenize("user\n", tmp_tok, 256, m.vocab_size);
-        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-        /* user prompt */
-        tmp_n = tokenize(prompt, tmp_tok, 256, m.vocab_size);
-        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-        /* "\n" */
-        tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
-        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-        /*  =2 */
-        if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
-
-        /* "\n" */
-        tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
-        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-        /* <|im_start|> */
-        if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-
-        /* "assistant\n" */
-        tmp_n = tokenize("assistant\n", tmp_tok, 256, m.vocab_size);
-        for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
 
         prompt_len = n;
     } else {
@@ -2209,7 +2642,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
     for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
-        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0);
+        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0, -1);
         if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
             printf(".");
             fflush(stdout);
@@ -2219,11 +2652,11 @@ int main(int argc, char **argv) {
     /* Last prompt token produces first generated token using sampling */
     if (prompt_len > 1 && !g_clean_output) printf("\n");
     if (prompt_len > 0) {
-        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, NULL, 0);
+        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, NULL, 0, eos_token);
         pos = prompt_len;
     } else {
         /* Empty prompt: use BOS token as seed */
-        next_token = forward(&m, &s, 1, 0, temp, top_k, NULL, 0);
+        next_token = forward(&m, &s, 1, 0, temp, top_k, NULL, 0, eos_token);
         pos = 1;
     }
 
@@ -2233,11 +2666,13 @@ int main(int argc, char **argv) {
         int n_last = 0;
         int printed = 0;
         /* Print first generated token immediately */
-        if (next_token != 0 && (no_eos_stop || next_token != eos_token)) {
+        if (do_raw_tokens || next_token != 0 || no_eos_stop) {
             if (do_raw_tokens) {
                 printf("[%d]", next_token);
-            } else {
+            } else if (next_token != 0) {
                 detokenize(next_token, m.vocab_size);
+            } else {
+                printf("<|endoftext|>");
             }
             fflush(stdout);
             if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
@@ -2245,13 +2680,16 @@ int main(int argc, char **argv) {
         }
         for (i = 1; i < n_generate; i++) {
             if (pos >= m.max_seq_len) break;
-            next_token = forward(&m, &s, next_token, pos, temp, top_k, last_tokens, n_last);
+            next_token = forward(&m, &s, next_token, pos, temp, top_k, last_tokens, n_last, -1);
             pos++;
-            if (next_token == 0 || (!no_eos_stop && next_token == eos_token)) break;
+            if (!do_raw_tokens && next_token == 0) break;
+            if (next_token == eos_token && !no_eos_stop) break;
             if (do_raw_tokens) {
                 printf("[%d]", next_token);
-            } else {
+            } else if (next_token != 0) {
                 detokenize(next_token, m.vocab_size);
+            } else {
+                printf("<|endoftext|>");
             }
             if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
             printed++;

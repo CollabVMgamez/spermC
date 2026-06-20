@@ -1,16 +1,37 @@
 @echo off
-REM Build gguf_infer.exe for Windows 2000 Beta 1
-REM Requires Visual C++ 6.0 (cl.exe)
+REM Build gguf_infer.exe.
+REM Works with cl.exe when the MSVC environment is already initialized.
+
+setlocal
+
+where cl.exe >nul 2>nul
+if not errorlevel 1 goto :build_cl
+
+where gcc.exe >nul 2>nul
+if not errorlevel 1 goto :build_gcc
 
 if exist "%MSVCDir%\bin\vcvars32.bat" call "%MSVCDir%\bin\vcvars32.bat"
+where cl.exe >nul 2>nul
+if not errorlevel 1 goto :build_cl
 
-cl /Ox /Ob2 /G6 /MT /W3 /Fe:gguf_infer.exe gguf_infer.c
+echo Build failed. Install Visual C++ or MinGW GCC and make sure it is on PATH.
+goto :done
+
+:build_cl
+cl /nologo /O2 /Ob2 /MT /W3 /TC /D_CRT_SECURE_NO_WARNINGS /Fe:gguf_infer.exe gguf_infer.c
+if errorlevel 1 goto :error
+goto :success
+
+:build_gcc
+gcc -O3 -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o gguf_infer.exe gguf_infer.c -lm
 if errorlevel 1 goto :error
 
+:success
 echo Build successful: gguf_infer.exe
 goto :done
 
 :error
-echo Build failed. Make sure cl.exe (Visual C++ 6.0) is in PATH.
+echo Build failed.
 
 :done
+endlocal
