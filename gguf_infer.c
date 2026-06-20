@@ -14,6 +14,34 @@
 #include <time.h>
 #include <ctype.h>
 
+typedef void *HINTERNET;
+typedef unsigned short INTERNET_PORT;
+#define WINHTTP_ACCESS_TYPE_DEFAULT_PROXY 0
+#define WINHTTP_NO_PROXY_NAME ((LPCWSTR)0)
+#define WINHTTP_NO_PROXY_BYPASS ((LPCWSTR)0)
+#define WINHTTP_NO_REFERER ((LPCWSTR)0)
+#define WINHTTP_NO_ADDITIONAL_HEADERS ((LPCWSTR)0)
+#define WINHTTP_DEFAULT_ACCEPT_TYPES ((LPCWSTR*)0)
+#define WINHTTP_FLAG_SECURE 0x00800000
+#define WINHTTP_ADDREQ_FLAG_ADD 0x20000000
+#define WINHTTP_QUERY_STATUS_CODE 19
+#define WINHTTP_QUERY_FLAG_NUMBER 0x20000000
+#define WINHTTP_HEADER_NAME_BY_INDEX ((LPCWSTR)0)
+#define WINHTTP_NO_HEADER_INDEX ((LPDWORD)0)
+#define INTERNET_SCHEME_HTTP 1
+#define INTERNET_SCHEME_HTTPS 2
+
+typedef HINTERNET (WINAPI *PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET (WINAPI *PFN_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *PFN_WinHttpOpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+typedef BOOL (WINAPI *PFN_WinHttpAddRequestHeaders)(HINTERNET, LPCWSTR, DWORD, DWORD);
+typedef BOOL (WINAPI *PFN_WinHttpSendRequest)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+typedef BOOL (WINAPI *PFN_WinHttpReceiveResponse)(HINTERNET, LPVOID);
+typedef BOOL (WINAPI *PFN_WinHttpQueryDataAvailable)(HINTERNET, LPDWORD);
+typedef BOOL (WINAPI *PFN_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *PFN_WinHttpCloseHandle)(HINTERNET);
+typedef BOOL (WINAPI *PFN_WinHttpQueryHeaders)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+
 /* --- Types --- */
 
 #ifdef _MSC_VER
@@ -84,6 +112,8 @@ typedef struct {
     float rope_freq_base;
     u32 alignment;
     char architecture[32];
+    char tokenizer_pre[32];
+    char chat_template[1024];
 } HParams;
 
 typedef struct {
@@ -155,6 +185,22 @@ static int contains_nocase(const char *haystack, const char *needle) {
         if (i == nlen) return 1;
     }
     return 0;
+}
+
+static double now_seconds(void) {
+#ifdef _WIN32
+    static double inv_freq = 0.0;
+    LARGE_INTEGER freq;
+    LARGE_INTEGER cur;
+    if (inv_freq == 0.0) {
+        QueryPerformanceFrequency(&freq);
+        inv_freq = 1.0 / (double)freq.QuadPart;
+    }
+    QueryPerformanceCounter(&cur);
+    return (double)cur.QuadPart * inv_freq;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
 }
 
 /* --- GGUF I/O --- */
@@ -317,6 +363,18 @@ static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
             memcpy(hp->architecture, *p, (size_t)slen);
             hp->architecture[slen] = '\0';
             *p += slen;
+        } else if (strcmp(key, "tokenizer.ggml.pre") == 0 && vtype == 8) {
+            u64 slen = read_u64(p);
+            if (slen > 31) slen = 31;
+            memcpy(hp->tokenizer_pre, *p, (size_t)slen);
+            hp->tokenizer_pre[slen] = '\0';
+            *p += slen;
+        } else if (strcmp(key, "tokenizer.chat_template") == 0 && vtype == 8) {
+            u64 slen = read_u64(p);
+            if (slen > sizeof(hp->chat_template) - 1) slen = sizeof(hp->chat_template) - 1;
+            memcpy(hp->chat_template, *p, (size_t)slen);
+            hp->chat_template[slen] = '\0';
+            *p += slen;
         } else {
             skip_value(vtype, p);
         }
@@ -395,13 +453,13 @@ loaded:
     /* Simple tensor section finder: search first 200KB for token embedding name */
     {
         static const char *names[] = {
+            "output_norm.weight", "norm.weight", "model.norm.weight",
             "token_embd.weight", "tok_embeddings.weight", "model.embed_tokens.weight",
             "token_embeddings.weight", "embedding.weight", "embed.weight", NULL
         };
         u8 *search_end = ctx->base + ctx->size;
         u8 *s;
         u8 *found = NULL;
-        if (search_end > ctx->base + 200000) search_end = ctx->base + 200000;
         for (s = ctx->base + 200; s < search_end - 64; s++) {
             int ni;
             for (ni = 0; names[ni]; ni++) {
@@ -575,9 +633,9 @@ static float silu(float x) {
     return x * fast_sigmoid(x);
 }
 
-/* llama.cpp-style top-k + temperature sampling */
+/* llama.cpp-style top-k / top-p / min-p + temperature sampling */
 #define MAX_TOPK 256
-static int sample_topk(float *logits, int n, float temp, int top_k, int ban_token) {
+static int sample_topk(float *logits, int n, float temp, int top_k, float top_p, float min_p, int ban_token) {
     int i, k;
     float maxv, sum, r, cdf;
     if (ban_token >= 0 && ban_token < n) logits[ban_token] = -1e30f;
@@ -586,13 +644,15 @@ static int sample_topk(float *logits, int n, float temp, int top_k, int ban_toke
         for (i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
-    /* top-k filtering using arrays (safe for negative logits) */
-    if (top_k > 0 && top_k < n) {
-        int kk = top_k;
+    if ((top_k > 0 && top_k < n) || (top_p > 0.0f && top_p < 1.0f) || min_p > 0.0f) {
+        int kk = n;
         int top_idx[MAX_TOPK];
         float top_val[MAX_TOPK];
         float top_prob[MAX_TOPK];
+        float keep_threshold;
+        if (top_k > 0 && top_k < n) kk = top_k;
         if (kk > MAX_TOPK) kk = MAX_TOPK;
+        if (kk < 1) kk = 1;
         for (k = 0; k < kk; k++) {
             top_idx[k] = -1;
             top_val[k] = -1e30f;
@@ -619,13 +679,44 @@ static int sample_topk(float *logits, int n, float temp, int top_k, int ban_toke
             sum += top_prob[k];
         }
         if (sum <= 0.0f) return top_idx[0] >= 0 ? top_idx[0] : 0;
-        r = ((float)rand() / (float)RAND_MAX) * sum;
+        keep_threshold = 0.0f;
+        if (min_p > 0.0f) keep_threshold = top_prob[0] * min_p;
         cdf = 0.0f;
         for (k = 0; k < kk; k++) {
+            if (top_prob[k] >= keep_threshold) cdf += top_prob[k];
+        }
+        if (cdf <= 0.0f) return top_idx[0] >= 0 ? top_idx[0] : 0;
+        if (top_p > 0.0f && top_p < 1.0f) {
+            float target = cdf * top_p;
+            float kept_cdf = 0.0f;
+            for (k = 0; k < kk; k++) {
+                if (top_prob[k] < keep_threshold) continue;
+                kept_cdf += top_prob[k];
+                if (kept_cdf >= target) {
+                    float r2 = ((float)rand() / (float)RAND_MAX) * kept_cdf;
+                    float cdf2 = 0.0f;
+                    int j;
+                    for (j = 0; j <= k; j++) {
+                        if (top_prob[j] < keep_threshold) continue;
+                        cdf2 += top_prob[j];
+                        if (r2 < cdf2) return top_idx[j];
+                    }
+                    return top_idx[k];
+                }
+            }
+            return top_idx[0] >= 0 ? top_idx[0] : 0;
+        }
+        r = ((float)rand() / (float)RAND_MAX) * cdf;
+        cdf = 0.0f;
+        for (k = 0; k < kk; k++) {
+            if (top_prob[k] < keep_threshold) continue;
             cdf += top_prob[k];
             if (r < cdf) return top_idx[k];
         }
-        return top_idx[kk - 1] >= 0 ? top_idx[kk - 1] : 0;
+        for (k = kk - 1; k >= 0; k--) {
+            if (top_prob[k] >= keep_threshold) return top_idx[k];
+        }
+        return top_idx[0] >= 0 ? top_idx[0] : 0;
     }
     /* Temperature scaling + softmax */
     maxv = logits[0] / temp;
@@ -1080,6 +1171,31 @@ static size_t tensor_row_bytes(const Tensor *t, int d) {
     }
 }
 
+static int should_parallelize_matvec(int n, int d) {
+    u64 work;
+    if (g_n_threads < 2 || !is_winnt()) return 0;
+    if (n < 96) return 0;
+    work = (u64)n * (u64)d;
+    if (work < 80000ULL) return 0;
+    if (n < 512) return work >= 100000ULL;
+    if (n < 2048) return work >= 80000ULL;
+    return 1;
+}
+
+static int pick_matvec_threads(int n, int d) {
+    u64 work = (u64)n * (u64)d;
+    int thread_count = g_n_threads;
+    if (thread_count > 8) thread_count = 8;
+    if (thread_count > n) thread_count = n;
+    /* Keep tiny matrices serial. Use 4 threads for mid-sized work and
+       allow 8 threads once the matrix is big enough to amortize the
+       extra synchronization. */
+    if (work < 600000ULL && thread_count > 4) thread_count = 4;
+    if (work < 250000ULL) thread_count = 1;
+    if (thread_count < 1) thread_count = 1;
+    return thread_count;
+}
+
 #ifdef _WIN32
 static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row);
 
@@ -1091,10 +1207,100 @@ typedef struct {
     int d;
 } MatvecThreadWork;
 
+#define MATVEC_POOL_MAX_THREADS 8
+
+typedef struct {
+    int index;
+} MatvecPoolWorker;
+
+typedef struct {
+    const Tensor *t;
+    const float *x;
+    float *y;
+    int n;
+    int d;
+    size_t row_bytes;
+    int thread_count;
+} MatvecPoolJob;
+
+typedef struct {
+    int initialized;
+    int thread_count;
+    HANDLE threads[MATVEC_POOL_MAX_THREADS];
+    HANDLE start_events[MATVEC_POOL_MAX_THREADS];
+    HANDLE done_events[MATVEC_POOL_MAX_THREADS];
+    MatvecPoolWorker workers[MATVEC_POOL_MAX_THREADS];
+    MatvecPoolJob job;
+} MatvecPoolState;
+
+static MatvecPoolState g_matvec_pool;
+
 static unsigned __stdcall matvec_thread_func(void *arg) {
     MatvecThreadWork *w = (MatvecThreadWork*)arg;
     matvec_no_parallel(&w->sub_t, w->x, w->y, w->n, w->d, NULL);
     return 0;
+}
+
+static unsigned __stdcall matvec_pool_thread(void *arg) {
+    MatvecPoolWorker *w = (MatvecPoolWorker*)arg;
+    int idx = w->index;
+    for (;;) {
+        WaitForSingleObject(g_matvec_pool.start_events[idx], INFINITE);
+        if (g_matvec_pool.job.thread_count <= 0) break;
+        if (idx < g_matvec_pool.job.thread_count) {
+            MatvecPoolJob job = g_matvec_pool.job;
+            int start = (int)(((u64)job.n * (u64)idx) / (u64)job.thread_count);
+            int end = (int)(((u64)job.n * (u64)(idx + 1)) / (u64)job.thread_count);
+            int rows = end - start;
+            if (rows > 0) {
+                Tensor sub_t = *job.t;
+                sub_t.data = (u8*)job.t->data + (size_t)start * job.row_bytes;
+                sub_t.dims[0] = (u64)rows;
+                matvec_no_parallel(&sub_t, job.x, job.y + start, rows, job.d, NULL);
+            }
+        }
+        SetEvent(g_matvec_pool.done_events[idx]);
+    }
+    return 0;
+}
+
+static int init_matvec_pool(void) {
+    int i;
+    if (g_matvec_pool.initialized) return 1;
+    memset(&g_matvec_pool, 0, sizeof(g_matvec_pool));
+    g_matvec_pool.thread_count = MATVEC_POOL_MAX_THREADS;
+    for (i = 0; i < MATVEC_POOL_MAX_THREADS; i++) {
+        g_matvec_pool.workers[i].index = i;
+        g_matvec_pool.start_events[i] = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_matvec_pool.done_events[i] = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!g_matvec_pool.start_events[i] || !g_matvec_pool.done_events[i]) return 0;
+        g_matvec_pool.threads[i] = (HANDLE)_beginthreadex(NULL, 0, matvec_pool_thread, &g_matvec_pool.workers[i], 0, NULL);
+        if (!g_matvec_pool.threads[i]) return 0;
+    }
+    g_matvec_pool.initialized = 1;
+    return 1;
+}
+
+static void run_matvec_pool(const Tensor *t, const float *x, float *y, int n, int d, size_t row_bytes, int thread_count) {
+    int i;
+    if (!g_matvec_pool.initialized && !init_matvec_pool()) {
+        matvec_no_parallel(t, x, y, n, d, NULL);
+        return;
+    }
+    g_matvec_pool.job.t = t;
+    g_matvec_pool.job.x = x;
+    g_matvec_pool.job.y = y;
+    g_matvec_pool.job.n = n;
+    g_matvec_pool.job.d = d;
+    g_matvec_pool.job.row_bytes = row_bytes;
+    g_matvec_pool.job.thread_count = thread_count;
+    for (i = 0; i < MATVEC_POOL_MAX_THREADS; i++) {
+        ResetEvent(g_matvec_pool.done_events[i]);
+    }
+    for (i = 0; i < thread_count; i++) {
+        SetEvent(g_matvec_pool.start_events[i]);
+    }
+    WaitForMultipleObjects(thread_count, g_matvec_pool.done_events, TRUE, INFINITE);
 }
 
 static int file_exists(const char *path) {
@@ -1332,11 +1538,6 @@ static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, in
     static int announced = 0;
     size_t row_bytes;
     int thread_count;
-    int i;
-    int failed;
-    HANDLE threads[16];
-    MatvecThreadWork work[16];
-    DWORD tids[16];
 
     if (g_n_threads < 2 || !is_winnt()) {
         matvec_no_parallel(t, x, y, n, d, NULL);
@@ -1355,9 +1556,7 @@ static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, in
         return;
     }
 
-    thread_count = g_n_threads;
-    if (thread_count > 8) thread_count = 8;
-    if (thread_count > n) thread_count = n;
+    thread_count = pick_matvec_threads(n, d);
     if (thread_count < 2) {
         matvec_no_parallel(t, x, y, n, d, NULL);
         return;
@@ -1368,48 +1567,7 @@ static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, in
         fflush(stdout);
         announced = 1;
     }
-
-    memset(threads, 0, sizeof(threads));
-    memset(work, 0, sizeof(work));
-    memset(tids, 0, sizeof(tids));
-    failed = 0;
-    for (i = 0; i < thread_count; i++) {
-        int start = (int)(((u64)n * (u64)i) / (u64)thread_count);
-        int end = (int)(((u64)n * (u64)(i + 1)) / (u64)thread_count);
-        int rows = end - start;
-        threads[i] = NULL;
-        if (rows <= 0) continue;
-        work[i].sub_t = *t;
-        work[i].sub_t.data = (u8*)t->data + (size_t)start * row_bytes;
-        work[i].sub_t.dims[0] = (u64)rows;
-        work[i].x = x;
-        work[i].y = y + start;
-        work[i].n = rows;
-        work[i].d = d;
-        threads[i] = (HANDLE)_beginthreadex(NULL, 0, matvec_thread_func, &work[i], 0, &tids[i]);
-        if (!threads[i]) {
-            failed = 1;
-            break;
-        }
-    }
-
-    if (failed) {
-        for (i = 0; i < thread_count; i++) {
-            if (threads[i]) {
-                WaitForSingleObject(threads[i], INFINITE);
-                CloseHandle(threads[i]);
-            }
-        }
-        matvec_no_parallel(t, x, y, n, d, NULL);
-        return;
-    }
-
-    for (i = 0; i < thread_count; i++) {
-        if (threads[i]) {
-            WaitForSingleObject(threads[i], INFINITE);
-            CloseHandle(threads[i]);
-        }
-    }
+    run_matvec_pool(t, x, y, n, d, row_bytes, thread_count);
 #else
     matvec_no_parallel(t, x, y, n, d, NULL);
 #endif
@@ -1659,7 +1817,7 @@ static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n,
 }
 
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
-    if (g_n_threads > 1 && n >= 4096 && is_winnt() &&
+    if (should_parallelize_matvec(n, d) &&
         (int)t->dims[0] == n && (int)t->dims[1] == d) {
         matvec_parallel(t, x, y, n, d);
         return;
@@ -2034,7 +2192,7 @@ static void free_runstate(RunState *s) {
 
 /* --- Forward pass --- */
 
-static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, int *recent, int recent_n, int ban_token) {
+static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, float top_p, float min_p, int *recent, int recent_n, int ban_token) {
     int dim = m->dim;
     int hidden_dim = m->hidden_dim;
     int n_layers = m->n_layers;
@@ -2189,7 +2347,7 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
             }
         }
     }
-    return sample_topk(s->logits, vocab_size, temp, top_k, ban_token);
+    return sample_topk(s->logits, vocab_size, temp, top_k, top_p, min_p, ban_token);
 }
 
 /* --- Tokenizer --- */
@@ -2349,11 +2507,51 @@ static int append_text_tokens(int *dst, int cap, int n, const char *text, int vo
     return n;
 }
 
+static void print_token_text_clean(const char *text, int len) {
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '<' && i + 5 < len &&
+            text[i + 1] == '0' &&
+            text[i + 2] == 'x' &&
+            isxdigit((unsigned char)text[i + 3]) &&
+            isxdigit((unsigned char)text[i + 4]) &&
+            text[i + 5] == '>') {
+            /* Byte-fallback token like <0xE4>; drop it instead of printing noise. */
+            i += 6;
+            continue;
+        }
+        if (c < 0x80) {
+            if (c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c < 127)) {
+                putchar((char)c);
+            } else if (c == ' ') {
+                putchar(' ');
+            }
+            i++;
+        } else if (i + 2 < len &&
+                   (unsigned char)text[i + 0] == 0xE2 &&
+                   (unsigned char)text[i + 1] == 0x96 &&
+                   (unsigned char)text[i + 2] == 0x81) {
+            /* SentencePiece leading marker "▁" -> plain space. */
+            putchar(' ');
+            i += 3;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+            i += 4;
+        } else {
+            i++;
+        }
+    }
+}
+
 static void detokenize(int token, int vocab_size) {
     /* Only skip padding token 0. Print everything else including EOS/BOS. */
     if (token == 0) return;
     if (g_vocab && token >= 0 && token < g_vocab_n && g_vocab[token].len > 0) {
-        fwrite(g_vocab[token].text, 1, g_vocab[token].len, stdout);
+        print_token_text_clean(g_vocab[token].text, g_vocab[token].len);
     } else {
         if (token >= 32 && token < 127) printf("%c", (char)token);
     }
@@ -2371,18 +2569,479 @@ static int find_special_token(const char *name) {
 }
 
 static void scan_special_tokens(void) {
-    int ids[8];
-    const char *names[8] = {
+    int ids[9];
+    const char *names[9] = {
         "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<s>", "</s>",
-        "<|user|>", "<|assistant|>", "\n"
+        "<bos>", "<|user|>", "<|assistant|>", "<start_of_turn>"
     };
     int i;
     printf("Special tokens: ");
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < 9; i++) {
         ids[i] = find_special_token(names[i]);
         if (ids[i] >= 0) printf("%s=%d ", names[i], ids[i]);
     }
+    if (find_special_token("<end_of_turn>") >= 0) printf("<end_of_turn>=%d ", find_special_token("<end_of_turn>"));
+    if (find_special_token("\n") >= 0) printf("\\n=%d ", find_special_token("\n"));
     printf("\n");
+}
+
+static void path_stem(const char *path, char *out, size_t out_cap) {
+    const char *base = path;
+    const char *p;
+    size_t len;
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!path) return;
+    for (p = path; *p; p++) {
+        if (*p == '\\' || *p == '/' || *p == ':') base = p + 1;
+    }
+    len = 0;
+    while (base[len] && base[len] != '.' && len + 1 < out_cap) len++;
+    memcpy(out, base, len);
+    out[len] = '\0';
+}
+
+static int append_raw(char *dst, size_t cap, size_t *len, const char *src) {
+    size_t slen = strlen(src);
+    if (*len + slen + 1 > cap) return 0;
+    memcpy(dst + *len, src, slen);
+    *len += slen;
+    dst[*len] = '\0';
+    return 1;
+}
+
+static int append_char_raw(char *dst, size_t cap, size_t *len, char c) {
+    if (*len + 2 > cap) return 0;
+    dst[(*len)++] = c;
+    dst[*len] = '\0';
+    return 1;
+}
+
+static int append_hex4(char *dst, size_t cap, size_t *len, unsigned int v) {
+    char tmp[7];
+    sprintf(tmp, "\\u%04X", v & 0xFFFFU);
+    return append_raw(dst, cap, len, tmp);
+}
+
+static int append_utf8_codepoint(char *dst, size_t cap, size_t *len, unsigned int cp) {
+    if (cp <= 0x7FU) {
+        return append_char_raw(dst, cap, len, (char)cp);
+    } else if (cp <= 0x7FFU) {
+        if (*len + 3 > cap) return 0;
+        dst[(*len)++] = (char)(0xC0 | (cp >> 6));
+        dst[(*len)++] = (char)(0x80 | (cp & 0x3F));
+        dst[*len] = '\0';
+        return 1;
+    } else if (cp <= 0xFFFFU) {
+        if (*len + 4 > cap) return 0;
+        dst[(*len)++] = (char)(0xE0 | (cp >> 12));
+        dst[(*len)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        dst[(*len)++] = (char)(0x80 | (cp & 0x3F));
+        dst[*len] = '\0';
+        return 1;
+    } else {
+        if (*len + 5 > cap) return 0;
+        dst[(*len)++] = (char)(0xF0 | (cp >> 18));
+        dst[(*len)++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        dst[(*len)++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        dst[(*len)++] = (char)(0x80 | (cp & 0x3F));
+        dst[*len] = '\0';
+        return 1;
+    }
+}
+
+static int append_json_string(char *dst, size_t cap, size_t *len, const char *src) {
+    const unsigned char *p = (const unsigned char*)src;
+    while (*p) {
+        unsigned char c = *p++;
+        if (c == '\"') {
+            if (!append_raw(dst, cap, len, "\\\"")) return 0;
+        } else if (c == '\\') {
+            if (!append_raw(dst, cap, len, "\\\\")) return 0;
+        } else if (c == '\b') {
+            if (!append_raw(dst, cap, len, "\\b")) return 0;
+        } else if (c == '\f') {
+            if (!append_raw(dst, cap, len, "\\f")) return 0;
+        } else if (c == '\n') {
+            if (!append_raw(dst, cap, len, "\\n")) return 0;
+        } else if (c == '\r') {
+            if (!append_raw(dst, cap, len, "\\r")) return 0;
+        } else if (c == '\t') {
+            if (!append_raw(dst, cap, len, "\\t")) return 0;
+        } else if (c < 0x20) {
+            if (!append_hex4(dst, cap, len, c)) return 0;
+        } else {
+            if (!append_char_raw(dst, cap, len, (char)c)) return 0;
+        }
+    }
+    return 1;
+}
+
+static int append_u32_text(char *dst, size_t cap, size_t *len, unsigned int v) {
+    char tmp[32];
+    sprintf(tmp, "%u", v);
+    return append_raw(dst, cap, len, tmp);
+}
+
+static int append_float_text(char *dst, size_t cap, size_t *len, float v) {
+    char tmp[64];
+    sprintf(tmp, "%.6g", (double)v);
+    return append_raw(dst, cap, len, tmp);
+}
+
+static int read_file_text(const char *path, char *buf, size_t cap) {
+    FILE *fp;
+    size_t r;
+    if (!path || !buf || cap == 0) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+    r = fread(buf, 1, cap - 1, fp);
+    buf[r] = '\0';
+    fclose(fp);
+    return 1;
+}
+
+static int decode_json_string(const char *src, char *dst, size_t dst_cap) {
+    const char *p = src;
+    size_t out = 0;
+    while (*p && out + 1 < dst_cap) {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '\"') break;
+        if (c != '\\') {
+            dst[out++] = (char)c;
+            continue;
+        }
+        c = (unsigned char)*p++;
+        if (c == 'n') dst[out++] = '\n';
+        else if (c == 'r') dst[out++] = '\r';
+        else if (c == 't') dst[out++] = '\t';
+        else if (c == 'b') dst[out++] = '\b';
+        else if (c == 'f') dst[out++] = '\f';
+        else if (c == '\\') dst[out++] = '\\';
+        else if (c == '\"') dst[out++] = '\"';
+        else if (c == 'u') {
+            unsigned int cp = 0;
+            int i;
+            for (i = 0; i < 4 && isxdigit((unsigned char)p[i]); i++) {
+                unsigned char ch = (unsigned char)p[i];
+                cp <<= 4;
+                if (ch >= '0' && ch <= '9') cp |= (unsigned int)(ch - '0');
+                else if (ch >= 'a' && ch <= 'f') cp |= (unsigned int)(10 + ch - 'a');
+                else if (ch >= 'A' && ch <= 'F') cp |= (unsigned int)(10 + ch - 'A');
+            }
+            if (i == 4) {
+                p += 4;
+                if (!append_utf8_codepoint(dst, dst_cap, &out, cp)) return 0;
+            }
+        } else {
+            dst[out++] = (char)c;
+        }
+    }
+    dst[out] = '\0';
+    return 1;
+}
+
+static int json_extract_string_field(const char *json, const char *field, char *out, size_t out_cap) {
+    const char *p = json;
+    size_t flen = strlen(field);
+    char needle[128];
+    if (!json || !field || !out || out_cap == 0) return 0;
+    if (flen + 3 >= sizeof(needle)) return 0;
+    needle[0] = '\"';
+    memcpy(needle + 1, field, flen);
+    needle[flen + 1] = '\"';
+    needle[flen + 2] = '\0';
+    while ((p = strstr(p, needle)) != NULL) {
+        const char *q = p + flen + 2;
+        while (*q && *q != ':') q++;
+        if (*q != ':') { p += flen + 2; continue; }
+        q++;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q != '\"') { p += flen + 2; continue; }
+        q++;
+        return decode_json_string(q, out, out_cap);
+    }
+    return 0;
+}
+
+static int utf8_to_wide(const char *src, WCHAR *dst, int dst_cap) {
+    int need;
+    if (!src || !dst || dst_cap <= 0) return 0;
+    need = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, dst_cap);
+    return need != 0;
+}
+
+static int parse_http_url(const char *url, int *secure, char *host, size_t host_cap,
+                          INTERNET_PORT *port, char *path, size_t path_cap) {
+    const char *p;
+    const char *host_start;
+    const char *host_end;
+    const char *path_start;
+    const char *colon;
+    size_t host_len;
+    size_t path_len;
+    if (!url || !secure || !host || !port || !path || host_cap == 0 || path_cap == 0) return 0;
+    p = strstr(url, "://");
+    if (!p) return 0;
+    if (strncmp(url, "https", 5) == 0) *secure = 1;
+    else if (strncmp(url, "http", 4) == 0) *secure = 0;
+    else return 0;
+    p += 3;
+    host_start = p;
+    while (*p && *p != '/' && *p != '?' && *p != '#') p++;
+    host_end = p;
+    colon = NULL;
+    for (p = host_start; p < host_end; p++) {
+        if (*p == ':') colon = p;
+    }
+    if (colon) {
+        host_len = (size_t)(colon - host_start);
+        *port = (INTERNET_PORT)atoi(colon + 1);
+        if (*port == 0) *port = *secure ? 443 : 80;
+    } else {
+        host_len = (size_t)(host_end - host_start);
+        *port = *secure ? 443 : 80;
+    }
+    if (host_len >= host_cap) host_len = host_cap - 1;
+    memcpy(host, host_start, host_len);
+    host[host_len] = '\0';
+    path_start = host_end;
+    if (*path_start == '\0') {
+        path[0] = '/';
+        path[1] = '\0';
+        return 1;
+    }
+    if (*path_start != '/') {
+        if (path_cap < 2) return 0;
+        path[0] = '/';
+        path_len = strlen(path_start);
+        if (path_len + 1 >= path_cap) path_len = path_cap - 2;
+        memcpy(path + 1, path_start, path_len);
+        path[path_len + 1] = '\0';
+        return 1;
+    }
+    path_len = strlen(path_start);
+    if (path_len >= path_cap) path_len = path_cap - 1;
+    memcpy(path, path_start, path_len);
+    path[path_len] = '\0';
+    return 1;
+}
+
+static int http_post_json(const char *url, const char *api_key, const char *body, char **out_resp) {
+    HMODULE dll;
+    PFN_WinHttpOpen pOpen;
+    PFN_WinHttpConnect pConnect;
+    PFN_WinHttpOpenRequest pOpenRequest;
+    PFN_WinHttpAddRequestHeaders pAddHeaders;
+    PFN_WinHttpSendRequest pSendRequest;
+    PFN_WinHttpReceiveResponse pReceiveResponse;
+    PFN_WinHttpQueryDataAvailable pQueryDataAvailable;
+    PFN_WinHttpReadData pReadData;
+    PFN_WinHttpCloseHandle pCloseHandle;
+    PFN_WinHttpQueryHeaders pQueryHeaders;
+    WCHAR w_host[256];
+    WCHAR w_path[2048];
+    WCHAR w_headers[1024];
+    char host[256];
+    char path[2048];
+    char request_path[2304];
+    char header_ascii[1024];
+    HINTERNET hSession = NULL;
+    HINTERNET hConnect = NULL;
+    HINTERNET hRequest = NULL;
+    DWORD status = 0;
+    DWORD status_len = sizeof(status);
+    const char *body_ptr = body ? body : "";
+    DWORD body_len = (DWORD)strlen(body_ptr);
+    char *resp = NULL;
+    size_t resp_len = 0;
+    size_t resp_cap = 0;
+    DWORD available = 0;
+    DWORD read_len = 0;
+    int secure = 0;
+    INTERNET_PORT port = 0;
+
+    if (!url || !out_resp) return 0;
+    *out_resp = NULL;
+
+    dll = LoadLibraryA("winhttp.dll");
+    if (!dll) {
+        fprintf(stderr, "API error: winhttp.dll not available\n");
+        return 0;
+    }
+    pOpen = (PFN_WinHttpOpen)GetProcAddress(dll, "WinHttpOpen");
+    pConnect = (PFN_WinHttpConnect)GetProcAddress(dll, "WinHttpConnect");
+    pOpenRequest = (PFN_WinHttpOpenRequest)GetProcAddress(dll, "WinHttpOpenRequest");
+    pAddHeaders = (PFN_WinHttpAddRequestHeaders)GetProcAddress(dll, "WinHttpAddRequestHeaders");
+    pSendRequest = (PFN_WinHttpSendRequest)GetProcAddress(dll, "WinHttpSendRequest");
+    pReceiveResponse = (PFN_WinHttpReceiveResponse)GetProcAddress(dll, "WinHttpReceiveResponse");
+    pQueryDataAvailable = (PFN_WinHttpQueryDataAvailable)GetProcAddress(dll, "WinHttpQueryDataAvailable");
+    pReadData = (PFN_WinHttpReadData)GetProcAddress(dll, "WinHttpReadData");
+    pCloseHandle = (PFN_WinHttpCloseHandle)GetProcAddress(dll, "WinHttpCloseHandle");
+    pQueryHeaders = (PFN_WinHttpQueryHeaders)GetProcAddress(dll, "WinHttpQueryHeaders");
+    if (!pOpen || !pConnect || !pOpenRequest || !pAddHeaders || !pSendRequest ||
+        !pReceiveResponse || !pQueryDataAvailable || !pReadData || !pCloseHandle || !pQueryHeaders) {
+        fprintf(stderr, "API error: WinHTTP exports missing\n");
+        FreeLibrary(dll);
+        return 0;
+    }
+
+    if (!parse_http_url(url, &secure, host, sizeof(host), &port, path, sizeof(path))) {
+        fprintf(stderr, "API error: invalid URL '%s'\n", url);
+        FreeLibrary(dll);
+        return 0;
+    }
+    sprintf(request_path, "%s", path[0] ? path : "/");
+    if (!utf8_to_wide(host, w_host, sizeof(w_host) / sizeof(w_host[0])) ||
+        !utf8_to_wide(request_path, w_path, sizeof(w_path) / sizeof(w_path[0]))) {
+        fprintf(stderr, "API error: could not convert request URL\n");
+        FreeLibrary(dll);
+        return 0;
+    }
+    if (api_key && api_key[0]) {
+        sprintf(header_ascii, "Content-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer %s\r\n", api_key);
+    } else {
+        sprintf(header_ascii, "Content-Type: application/json\r\nAccept: application/json\r\n");
+    }
+    if (!utf8_to_wide(header_ascii, w_headers, sizeof(w_headers) / sizeof(w_headers[0]))) {
+        fprintf(stderr, "API error: could not convert headers\n");
+        FreeLibrary(dll);
+        return 0;
+    }
+    hSession = pOpen(L"windows2000ai/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) goto cleanup;
+    hConnect = pConnect(hSession, w_host, port, 0);
+    if (!hConnect) goto cleanup;
+    hRequest = pOpenRequest(hConnect, L"POST", w_path, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) goto cleanup;
+    if (!pAddHeaders(hRequest, w_headers, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD)) goto cleanup;
+    if (!pSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                      (LPVOID)body_ptr, body_len, body_len, 0)) goto cleanup;
+    if (!pReceiveResponse(hRequest, NULL)) goto cleanup;
+    if (pQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                      WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len,
+                      WINHTTP_NO_HEADER_INDEX)) {
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "API error: HTTP status %lu\n", (unsigned long)status);
+        }
+    }
+
+    for (;;) {
+        if (!pQueryDataAvailable(hRequest, &available)) break;
+        if (available == 0) break;
+        if (resp_len + available + 1 > resp_cap) {
+            size_t new_cap = resp_cap ? resp_cap * 2 : 8192;
+            while (new_cap < resp_len + available + 1) new_cap *= 2;
+            {
+                char *tmp = (char*)realloc(resp, new_cap);
+                if (!tmp) goto cleanup;
+                resp = tmp;
+            }
+            resp_cap = new_cap;
+        }
+        if (!pReadData(hRequest, resp + resp_len, available, &read_len)) break;
+        resp_len += read_len;
+        resp[resp_len] = '\0';
+    }
+
+    if (!resp) {
+        resp = (char*)malloc(1);
+        if (!resp) goto cleanup;
+        resp[0] = '\0';
+    }
+
+    *out_resp = resp;
+    resp = NULL;
+
+cleanup:
+    free(resp);
+    if (hRequest) pCloseHandle(hRequest);
+    if (hConnect) pCloseHandle(hConnect);
+    if (hSession) pCloseHandle(hSession);
+    FreeLibrary(dll);
+    return *out_resp != NULL;
+}
+
+static int run_api_mode(const char *model_path, const char *prompt, int n_generate,
+                        float temp, float top_p, const char *api_url,
+                        const char *api_model, const char *api_key,
+                        const char *api_system) {
+    char model_name[256];
+    char *body;
+    char *resp;
+    char content[65536];
+    size_t cap;
+    size_t len = 0;
+    double t0 = now_seconds();
+    int ok;
+
+    if (!api_url || !api_url[0]) api_url = "https://api.openai.com/v1/chat/completions";
+    if (!api_model || !api_model[0]) {
+        path_stem(model_path, model_name, sizeof(model_name));
+        if (!model_name[0]) strcpy(model_name, "gpt-4o-mini");
+        api_model = model_name;
+    }
+
+    cap = (prompt ? strlen(prompt) : 0) * 6 + (api_system ? strlen(api_system) : 0) * 6 + 4096;
+    body = (char*)malloc(cap);
+    if (!body) {
+        fprintf(stderr, "API error: out of memory\n");
+        return 1;
+    }
+    body[0] = '\0';
+
+    if (!append_raw(body, cap, &len, "{")) goto body_fail;
+    if (!append_raw(body, cap, &len, "\"model\":\"")) goto body_fail;
+    if (!append_json_string(body, cap, &len, api_model)) goto body_fail;
+    if (!append_raw(body, cap, &len, "\",\"messages\":[")) goto body_fail;
+    if (api_system && api_system[0]) {
+        if (!append_raw(body, cap, &len, "{\"role\":\"system\",\"content\":\"")) goto body_fail;
+        if (!append_json_string(body, cap, &len, api_system)) goto body_fail;
+        if (!append_raw(body, cap, &len, "\"},")) goto body_fail;
+    }
+    if (!append_raw(body, cap, &len, "{\"role\":\"user\",\"content\":\"")) goto body_fail;
+    if (!append_json_string(body, cap, &len, prompt ? prompt : "")) goto body_fail;
+    if (!append_raw(body, cap, &len, "\"}")) goto body_fail;
+    if (!append_raw(body, cap, &len, "],\"temperature\":")) goto body_fail;
+    if (!append_float_text(body, cap, &len, temp)) goto body_fail;
+    if (!append_raw(body, cap, &len, ",\"top_p\":")) goto body_fail;
+    if (!append_float_text(body, cap, &len, top_p)) goto body_fail;
+    if (!append_raw(body, cap, &len, ",\"max_tokens\":")) goto body_fail;
+    if (!append_u32_text(body, cap, &len, (unsigned int)(n_generate > 0 ? n_generate : 1))) goto body_fail;
+    if (!append_raw(body, cap, &len, ",\"stream\":false}")) goto body_fail;
+
+    if (!g_clean_output) {
+        printf("API mode: %s\n", api_url);
+        printf("API model: %s\n", api_model);
+    }
+
+    ok = http_post_json(api_url, api_key, body, &resp);
+    free(body);
+    if (!ok || !resp) {
+        fprintf(stderr, "API error: request failed\n");
+        return 1;
+    }
+
+    if (!json_extract_string_field(resp, "content", content, sizeof(content)) &&
+        !json_extract_string_field(resp, "text", content, sizeof(content))) {
+        if (!g_clean_output) fprintf(stderr, "API warning: could not extract text field\n");
+        printf("%s\n", resp);
+    } else {
+        printf("%s\n", content);
+    }
+    if (!g_clean_output) {
+        printf("API latency: %.3f s\n", now_seconds() - t0);
+    }
+    free(resp);
+    return 0;
+
+body_fail:
+    free(body);
+    fprintf(stderr, "API error: failed to build request body\n");
+    return 1;
 }
 
 /* --- Main --- */
@@ -2396,21 +3055,34 @@ int main(int argc, char **argv) {
     char *tok_path = NULL;
     char *prompt = "";
     char *prompt_file = NULL;
+    char *api_url = NULL;
+    char *api_model = NULL;
+    char *api_key = NULL;
+    char *api_system = NULL;
     int n_generate = 64;
     float temp = 0.8f;
     float top_p = 0.95f;
+    float min_p = 0.0f;
     int top_k = 40;
     int eos_token = 2;
     int no_eos_stop = 0;
     int do_chat = 0;
+    int use_api = 0;
     int do_info = 0;
     int do_list = 0;
     int do_raw_tokens = 0;
     int tinyllama_mode = 0;
+    int gemma3_mode = 0;
+    int smollm2_mode = 0;
+    int slopllm_mode = 0;
     int seq_user = 0;
     int n_heads_user = 0;
     int n_kv_user = 0;
     int hidden_user = 0;
+    int temp_user = 0;
+    int top_k_user = 0;
+    int top_p_user = 0;
+    int min_p_user = 0;
     unsigned int seed = 0;
     int arg;
     int pos;
@@ -2418,8 +3090,10 @@ int main(int argc, char **argv) {
     int *prompt_tokens;
     int next_token = 0;
     int i;
-    (void)top_p;
-
+    double t_request_start;
+    double t_first_token = 0.0;
+    double t_end;
+    int tokens_printed = 0;
     if (argc < 2) {
         printf("Usage: gguf_infer.exe <model.gguf> [options]\n");
         printf("Options:\n");
@@ -2429,6 +3103,11 @@ int main(int argc, char **argv) {
         printf("  --no-eos-stop   Do not stop on EOS token\n");
         printf("  --raw-tokens    Print token IDs instead of text\n");
         printf("  --chat          Wrap prompt in chat template\n");
+        printf("  --api           Use an OpenAI-compatible API instead of local GGUF inference\n");
+        printf("  --api-url <u>   API endpoint URL (default OPENAI_BASE_URL or OpenAI chat completions)\n");
+        printf("  --api-model <m> API model name (default OPENAI_MODEL or model file stem)\n");
+        printf("  --api-key <k>   API key (default OPENAI_API_KEY)\n");
+        printf("  --api-system <s> System prompt for API mode\n");
         printf("  -f <file>       Read prompt from file\n");
         printf("  -n <num>        Max tokens to generate (default 64)\n");
         printf("  -t <temp>       Temperature, 0=argmax (default 0.8)\n");
@@ -2440,7 +3119,8 @@ int main(int argc, char **argv) {
         printf("  --hidden <n>    Override hidden dim\n");
         printf("  --seq <n>       Override max sequence length\n");
         printf("  --top-k <n>     Top-k sampling, 0=disabled (default 40)\n");
-        printf("  --top-p <p>     Top-p sampling (not yet implemented)\n");
+        printf("  --top-p <p>     Top-p sampling (default 0.95)\n");
+        printf("  --min-p <p>     Min-p sampling (default 0.0)\n");
         printf("  --eos <id>      EOS token ID (default 2)\n");
         printf("  --repeat-penalty <p>  Repetition penalty (default 1.15)\n");
         printf("  --threads <n|auto>   Parallel threads for large matmul (WinNT only, default auto)\n");
@@ -2458,6 +3138,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--no-eos-stop") == 0) { no_eos_stop = 1; }
         else if (strcmp(argv[arg], "--raw-tokens") == 0) { do_raw_tokens = 1; }
         else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
+        else if (strcmp(argv[arg], "--api") == 0) { use_api = 1; }
+        else if (strcmp(argv[arg], "--api-url") == 0 && arg + 1 < argc) { api_url = argv[arg+1]; arg++; }
+        else if (strcmp(argv[arg], "--api-model") == 0 && arg + 1 < argc) { api_model = argv[arg+1]; arg++; }
+        else if (strcmp(argv[arg], "--api-key") == 0 && arg + 1 < argc) { api_key = argv[arg+1]; arg++; }
+        else if (strcmp(argv[arg], "--api-system") == 0 && arg + 1 < argc) { api_system = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--threads") == 0 && arg + 1 < argc) {
             if (strcmp(argv[arg+1], "auto") == 0 || strcmp(argv[arg+1], "AUTO") == 0) g_n_threads = 0;
             else g_n_threads = atoi(argv[arg+1]);
@@ -2466,7 +3151,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
         else if (strcmp(argv[arg], "-f") == 0 && arg + 1 < argc) { prompt_file = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); arg++; }
-        else if (strcmp(argv[arg], "-t") == 0 && arg + 1 < argc) { temp = (float)atof(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "-t") == 0 && arg + 1 < argc) { temp = (float)atof(argv[arg+1]); temp_user = 1; arg++; }
         else if (strcmp(argv[arg], "-s") == 0 && arg + 1 < argc) { seed = (unsigned int)atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--prompt") == 0 && arg + 1 < argc) { prompt = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--tok") == 0 && arg + 1 < argc) { tok_path = argv[arg+1]; arg++; }
@@ -2474,8 +3159,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--n_kv") == 0 && arg + 1 < argc) { n_kv_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--hidden") == 0 && arg + 1 < argc) { hidden_user = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--seq") == 0 && arg + 1 < argc) { seq_user = atoi(argv[arg+1]); arg++; }
-        else if (strcmp(argv[arg], "--top-k") == 0 && arg + 1 < argc) { top_k = atoi(argv[arg+1]); arg++; }
-        else if (strcmp(argv[arg], "--top-p") == 0 && arg + 1 < argc) { top_p = (float)atof(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "--top-k") == 0 && arg + 1 < argc) { top_k = atoi(argv[arg+1]); top_k_user = 1; arg++; }
+        else if (strcmp(argv[arg], "--top-p") == 0 && arg + 1 < argc) { top_p = (float)atof(argv[arg+1]); top_p_user = 1; arg++; }
+        else if (strcmp(argv[arg], "--min-p") == 0 && arg + 1 < argc) { min_p = (float)atof(argv[arg+1]); min_p_user = 1; arg++; }
         else if (strcmp(argv[arg], "--eos") == 0 && arg + 1 < argc) { eos_token = atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--repeat-penalty") == 0 && arg + 1 < argc) { m.repeat_penalty = (float)atof(argv[arg+1]); arg++; }
     }
@@ -2489,6 +3175,19 @@ int main(int argc, char **argv) {
     if (!g_clean_output) {
         printf("gguf_infer v6 (multi-arch + sorted tokenizer)\n");
         printf("Threads: %d\n", g_n_threads);
+    }
+
+    if (use_api) {
+        char prompt_buf[8192];
+        if (prompt_file && read_file_text(prompt_file, prompt_buf, sizeof(prompt_buf))) {
+            prompt = prompt_buf;
+        }
+        if (!api_url) api_url = getenv("OPENAI_BASE_URL");
+        if (!api_url) api_url = getenv("OPENAI_API_BASE");
+        if (!api_key) api_key = getenv("OPENAI_API_KEY");
+        if (!api_model) api_model = getenv("OPENAI_MODEL");
+        if (!api_system) api_system = getenv("OPENAI_SYSTEM_PROMPT");
+        return run_api_mode(model_path, prompt, n_generate, temp, top_p, api_url, api_model, api_key, api_system);
     }
 
     ctx = gguf_load(model_path);
@@ -2517,6 +3216,22 @@ int main(int argc, char **argv) {
     }
 
     hp = ctx->hp;
+    gemma3_mode = (m.arch == ARCH_GEMMA3) ||
+                  contains_nocase(model_path, "gemma3") ||
+                  contains_nocase(hp.chat_template, "start_of_turn");
+    smollm2_mode = contains_nocase(model_path, "smollm2") ||
+                   contains_nocase(hp.tokenizer_pre, "smollm") ||
+                   contains_nocase(hp.chat_template, "SmolLM");
+    slopllm_mode = contains_nocase(model_path, "slopllm") ||
+                   contains_nocase(hp.chat_template, "SlopLLM") ||
+                   contains_nocase(hp.chat_template, "SlopAI");
+
+    if (m.arch == ARCH_GEMMA3) {
+        if (!temp_user) temp = 1.0f;
+        if (!top_k_user) top_k = 64;
+        if (!top_p_user) top_p = 0.95f;
+        if (!min_p_user) min_p = 0.0f;
+    }
 
     load_tokenizer_auto(model_path, tok_path, ctx);
 
@@ -2562,18 +3277,35 @@ int main(int argc, char **argv) {
     prompt_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
 
     /* Build prompt tokens */
-    if (do_chat || tinyllama_mode) {
+    if (smollm2_mode || tinyllama_mode || gemma3_mode || slopllm_mode || do_chat) {
+        int tok_bos = find_special_token("<bos>");
         int tok_im_start = find_special_token("<|im_start|>");
         int tok_im_end = find_special_token("<|im_end|>");
         int n = 0;
 
-        if (tinyllama_mode) {
+        if (smollm2_mode) {
+            if (!g_clean_output) printf("Chat tokens: smollm2 ChatML style\n");
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_start|>user\n", m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_end|>\n", m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_start|>assistant\n", m.vocab_size);
+        } else if (gemma3_mode) {
+            if (!g_clean_output) printf("Chat tokens: gemma3 start_of_turn style\n");
+            if (tok_bos >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_bos;
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>user\n", m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<end_of_turn>\n", m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>model\n", m.vocab_size);
+        } else if (tinyllama_mode) {
             if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n,
-                "<s>[INST] <<SYS>>\nYou are a helpful, respectful and honest assistant.\n<</SYS>>\n\n",
-                m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<s>[INST] ", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " [/INST]", m.vocab_size);
+        } else if (slopllm_mode) {
+            if (!g_clean_output) printf("Chat tokens: slopllm user/assistant style\n");
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "user: ", m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " assistant:", m.vocab_size);
         } else {
             int tmp_tok[256];
             int tmp_n;
@@ -2628,7 +3360,7 @@ int main(int argc, char **argv) {
                 int tlen = g_vocab[prompt_tokens[i]].len;
                 if (tlen > 0 && tlen < 20) {
                     printf("'");
-                    fwrite(g_vocab[prompt_tokens[i]].text, 1, tlen, stdout);
+                    print_token_text_clean(g_vocab[prompt_tokens[i]].text, tlen);
                     printf("' ");
                 }
             }
@@ -2637,12 +3369,13 @@ int main(int argc, char **argv) {
     }
 
     /* Process prompt tokens silently to fill KV cache */
+    t_request_start = now_seconds();
     if (prompt_len > 1 && !g_clean_output) {
         printf("Prefill %d tokens...", prompt_len);
         fflush(stdout);
     }
     for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
-        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, NULL, 0, -1);
+        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1);
         if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
             printf(".");
             fflush(stdout);
@@ -2652,11 +3385,11 @@ int main(int argc, char **argv) {
     /* Last prompt token produces first generated token using sampling */
     if (prompt_len > 1 && !g_clean_output) printf("\n");
     if (prompt_len > 0) {
-        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, NULL, 0, eos_token);
+        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, eos_token);
         pos = prompt_len;
     } else {
         /* Empty prompt: use BOS token as seed */
-        next_token = forward(&m, &s, 1, 0, temp, top_k, NULL, 0, eos_token);
+        next_token = forward(&m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, eos_token);
         pos = 1;
     }
 
@@ -2664,9 +3397,9 @@ int main(int argc, char **argv) {
     {
         int *last_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
         int n_last = 0;
-        int printed = 0;
         /* Print first generated token immediately */
         if (do_raw_tokens || next_token != 0 || no_eos_stop) {
+            if (tokens_printed == 0) t_first_token = now_seconds();
             if (do_raw_tokens) {
                 printf("[%d]", next_token);
             } else if (next_token != 0) {
@@ -2676,11 +3409,11 @@ int main(int argc, char **argv) {
             }
             fflush(stdout);
             if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
-            printed++;
+            tokens_printed++;
         }
         for (i = 1; i < n_generate; i++) {
             if (pos >= m.max_seq_len) break;
-            next_token = forward(&m, &s, next_token, pos, temp, top_k, last_tokens, n_last, -1);
+            next_token = forward(&m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, -1);
             pos++;
             if (!do_raw_tokens && next_token == 0) break;
             if (next_token == eos_token && !no_eos_stop) break;
@@ -2691,13 +3424,26 @@ int main(int argc, char **argv) {
             } else {
                 printf("<|endoftext|>");
             }
+            if (tokens_printed == 0) t_first_token = now_seconds();
             if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
-            printed++;
+            tokens_printed++;
             fflush(stdout);
         }
         free(last_tokens);
     }
     printf("\n");
+    t_end = now_seconds();
+    if (tokens_printed > 0) {
+        double ttft_s = t_first_token - t_request_start;
+        double gen_s = t_end - t_first_token;
+        double tps = 0.0;
+        int gen_tokens = tokens_printed > 1 ? (tokens_printed - 1) : 0;
+        if (gen_tokens > 0 && gen_s > 0.0) tps = (double)gen_tokens / gen_s;
+        printf("Stats: TTFT=%.3fs, TPS=%.2f tok/s, output=%d tokens, prompt=%d tokens, total=%.3fs\n",
+               ttft_s, tps, tokens_printed, prompt_len, t_end - t_request_start);
+    } else {
+        printf("Stats: no tokens produced, total=%.3fs\n", t_end - t_request_start);
+    }
 
     free(prompt_tokens);
     free_runstate(&s);

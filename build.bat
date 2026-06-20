@@ -23,7 +23,7 @@ if errorlevel 1 goto :error
 goto :success
 
 :build_gcc
-gcc -O3 -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o gguf_infer.exe gguf_infer.c -lm
+gcc -O3 -march=native -mtune=native -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o gguf_infer.exe gguf_infer.c -lm
 if errorlevel 1 goto :error
 
 :success
