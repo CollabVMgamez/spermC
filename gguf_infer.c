@@ -110,6 +110,7 @@ typedef struct {
     float attention_layer_norm_rms_epsilon;
     u32 rope_dimension_count;
     float rope_freq_base;
+    u32 attention_sliding_window;
     u32 alignment;
     char architecture[32];
     char tokenizer_pre[32];
@@ -131,21 +132,29 @@ typedef struct {
 
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len, head_dim;
+    int q_dim, kv_dim;
+    int attention_sliding_window;
     float norm_eps, rope_theta, rsqrt_head_dim;
     int tok_embd_transposed; /* 1 if token_embd.weight is [dim, vocab] instead of [vocab, dim] */
     float *cached_embd;      /* exact f32 cache for transposed token embeddings/output */
     float *cached_output;    /* exact f32 cache for transposed output head */
     float *rope_cos;         /* precomputed RoPE cos table [max_seq_len][head_dim/2] */
     float *rope_sin;         /* precomputed RoPE sin table [max_seq_len][head_dim/2] */
+    float *rope_cos_global;
+    float *rope_sin_global;
     Tensor *tok_embd;
     Tensor *output_norm;
     Tensor *output;
     Tensor **attn_norm;
+    Tensor **attn_q_norm;
+    Tensor **attn_k_norm;
     Tensor **attn_q;
     Tensor **attn_k;
     Tensor **attn_v;
     Tensor **attn_o;
     Tensor **ffn_norm;
+    Tensor **post_attn_norm;
+    Tensor **post_ffn_norm;
     Tensor **ffn_gate;
     Tensor **ffn_up;
     Tensor **ffn_down;
@@ -323,40 +332,52 @@ static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
             hp->alignment = read_u32(p);
         } else if (meta_key_eq(key, "llama.", "context_length") ||
                    meta_key_eq(key, "qwen2.", "context_length") ||
+                   meta_key_eq(key, "gemma3.", "context_length") ||
                    strcmp(key, "context_length") == 0) {
             if (vtype == 4) hp->context_length = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.", "embedding_length") ||
                    meta_key_eq(key, "qwen2.", "embedding_length") ||
+                   meta_key_eq(key, "gemma3.", "embedding_length") ||
                    strcmp(key, "embedding_length") == 0) {
             if (vtype == 4) hp->embedding_length = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.", "feed_forward_length") ||
                    meta_key_eq(key, "qwen2.", "feed_forward_length") ||
+                   meta_key_eq(key, "gemma3.", "feed_forward_length") ||
                    strcmp(key, "feed_forward_length") == 0) {
             if (vtype == 4) hp->feed_forward_length = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.", "block_count") ||
                    meta_key_eq(key, "qwen2.", "block_count") ||
+                   meta_key_eq(key, "gemma3.", "block_count") ||
                    strcmp(key, "block_count") == 0) {
             if (vtype == 4) hp->block_count = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.attention.", "head_count") ||
                    meta_key_eq(key, "qwen2.attention.", "head_count") ||
+                   meta_key_eq(key, "gemma3.attention.", "head_count") ||
                    strcmp(key, "attention.head_count") == 0) {
             if (vtype == 4) hp->attention_head_count = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.attention.", "head_count_kv") ||
                    meta_key_eq(key, "qwen2.attention.", "head_count_kv") ||
+                   meta_key_eq(key, "gemma3.attention.", "head_count_kv") ||
                    strcmp(key, "attention.head_count_kv") == 0) {
             if (vtype == 4) hp->attention_head_count_kv = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.attention.", "layer_norm_rms_epsilon") ||
                    meta_key_eq(key, "qwen2.attention.", "layer_norm_rms_epsilon") ||
+                   meta_key_eq(key, "gemma3.attention.", "layer_norm_rms_epsilon") ||
                    strcmp(key, "attention.layer_norm_rms_epsilon") == 0) {
             if (vtype == 6) { float val; memcpy(&val, *p, 4); *p += 4; hp->attention_layer_norm_rms_epsilon = val; } else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.rope.", "dimension_count") ||
                    meta_key_eq(key, "qwen2.rope.", "dimension_count") ||
+                   meta_key_eq(key, "gemma3.rope.", "dimension_count") ||
                    strcmp(key, "rope.dimension_count") == 0) {
             if (vtype == 4) hp->rope_dimension_count = read_u32(p); else skip_value(vtype, p);
         } else if (meta_key_eq(key, "llama.rope.", "freq_base") ||
                    meta_key_eq(key, "qwen2.rope.", "freq_base") ||
+                   meta_key_eq(key, "gemma3.rope.", "freq_base") ||
                    strcmp(key, "rope.freq_base") == 0) {
             if (vtype == 6) { float val; memcpy(&val, *p, 4); *p += 4; hp->rope_freq_base = val; } else skip_value(vtype, p);
+        } else if (meta_key_eq(key, "gemma3.attention.", "sliding_window") ||
+                   strcmp(key, "attention.sliding_window") == 0) {
+            if (vtype == 4) hp->attention_sliding_window = read_u32(p); else skip_value(vtype, p);
         } else if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
             u64 slen = read_u64(p);
             if (slen > 31) slen = 31;
@@ -538,6 +559,29 @@ static Tensor *find_tensor_f(GGUFContext *ctx, const char *fmt, int n) {
     return find_tensor(ctx, name);
 }
 
+static int tensor_width(const Tensor *t, int model_dim) {
+    int a, b;
+    if (!t || t->n_dims < 2) return model_dim;
+    a = (int)t->dims[0];
+    b = (int)t->dims[1];
+    if (a == model_dim && b != model_dim) return b;
+    if (b == model_dim && a != model_dim) return a;
+    if (a > b) return a;
+    return b;
+}
+
+static int gcd_int(int a, int b) {
+    int t;
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b != 0) {
+        t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
 static void list_tensors(GGUFContext *ctx) {
     u64 i;
     printf("Tensors in file (%u total):\n", (unsigned int)ctx->n_tensors);
@@ -631,6 +675,37 @@ static float silu(float x) {
     if (x >= 5.0f) return x;
     if (x <= -5.0f) return 0.0f;
     return x * fast_sigmoid(x);
+}
+
+static int vector_has_nan(const float *v, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (!(v[i] == v[i])) return 1;
+    }
+    return 0;
+}
+
+static int vector_has_nonfinite(const float *v, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (v[i] != v[i] || v[i] > 1e30f || v[i] < -1e30f) return 1;
+    }
+    return 0;
+}
+
+static int first_nonfinite_index(const float *v, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (v[i] != v[i] || v[i] > 1e30f || v[i] < -1e30f) return i;
+    }
+    return -1;
+}
+
+static float clamp_nonfinite(float v) {
+    if (v != v) return 0.0f;
+    if (v > 1e30f) return 0.0f;
+    if (v < -1e30f) return 0.0f;
+    return v;
 }
 
 /* llama.cpp-style top-k / top-p / min-p + temperature sampling */
@@ -1015,13 +1090,13 @@ static void matvec_q4k(const BlockQ4K *w, const float *x, float *y, int n, int d
                 m2 = min_all * m;
                 if (rem > 64) rem = 64;
                 for (l = 0; l < 32 && l < rem; l++) {
-                    sum += (d1 * (q[l] & 0xF) - m1) * xb[jj + l];
+                    sum += clamp_nonfinite(d1 * (float)(q[l] & 0xF) - m1) * xb[jj + l];
                 }
                 if (rem > 32) {
                     int rem2 = rem - 32;
                     if (rem2 > 32) rem2 = 32;
                     for (l = 0; l < rem2; l++) {
-                        sum += (d2 * (q[l] >> 4) - m2) * xb[jj + 32 + l];
+                        sum += clamp_nonfinite(d2 * (float)(q[l] >> 4) - m2) * xb[jj + 32 + l];
                     }
                 }
                 q += 32;
@@ -1064,9 +1139,9 @@ static void matvec_q5k(const BlockQ5K *w, const float *x, float *y, int n, int d
                 for (l = 0; l < 32 && l < rem; l++) {
                     int x0 = (ql[l] & 0x0F) + (qh[l] & u1 ? 16 : 0);
                     int x1 = (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0);
-                    sum += (d1 * (float)x0 - m1) * xb[jj + l + 0];
+                    sum += clamp_nonfinite(d1 * (float)x0 - m1) * xb[jj + l + 0];
                     if (l + 32 < rem) {
-                        sum += (d2 * (float)x1 - m2) * xb[jj + l + 32];
+                        sum += clamp_nonfinite(d2 * (float)x1 - m2) * xb[jj + l + 32];
                     }
                 }
                 ql += 32; is += 2;
@@ -1102,10 +1177,10 @@ static void matvec_q6k(const BlockQ6K *w, const float *x, float *y, int n, int d
                     int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int q3 = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                     int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    if (l + 0 < rem) sum += d_all * (float)sc[is + 0] * (float)q1 * xb[l + 0];
-                    if (l + 32 < rem) sum += d_all * (float)sc[is + 2] * (float)q2 * xb[l + 32];
-                    if (l + 64 < rem) sum += d_all * (float)sc[is + 4] * (float)q3 * xb[l + 64];
-                    if (l + 96 < rem) sum += d_all * (float)sc[is + 6] * (float)q4 * xb[l + 96];
+                    if (l + 0 < rem) sum += clamp_nonfinite(d_all * (float)sc[is + 0] * (float)q1) * xb[l + 0];
+                    if (l + 32 < rem) sum += clamp_nonfinite(d_all * (float)sc[is + 2] * (float)q2) * xb[l + 32];
+                    if (l + 64 < rem) sum += clamp_nonfinite(d_all * (float)sc[is + 4] * (float)q3) * xb[l + 64];
+                    if (l + 96 < rem) sum += clamp_nonfinite(d_all * (float)sc[is + 6] * (float)q4) * xb[l + 96];
                 }
                 xb += 128;
                 ql += 64;
@@ -1131,25 +1206,35 @@ static int default_thread_count(void) {
 #ifdef _WIN32
     DWORD_PTR processMask = 0, systemMask = 0;
     int n = 0;
+    int sys_n = 0;
     if (GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask)) {
         while (processMask) {
             n += (int)(processMask & 1);
             processMask >>= 1;
-        }
-        if (n > 0) {
-            if (n > 8) n = 8;
-            return n;
         }
     }
     {
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         if (si.dwNumberOfProcessors > 0) {
-            n = (int)si.dwNumberOfProcessors;
-            if (n > 8) n = 8;
-            return n;
+            sys_n = (int)si.dwNumberOfProcessors;
         }
     }
+    if (sys_n > n) n = sys_n;
+    {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        if (k32) {
+            typedef WORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
+            PFN_GetActiveProcessorCount pGetActiveProcessorCount;
+            pGetActiveProcessorCount = (PFN_GetActiveProcessorCount)GetProcAddress(k32, "GetActiveProcessorCount");
+            if (pGetActiveProcessorCount) {
+                int active_n = (int)pGetActiveProcessorCount((WORD)-1);
+                if (active_n > n) n = active_n;
+            }
+        }
+    }
+    if (n > 8) n = 8;
+    if (n > 0) return n;
 #endif
     return 1;
 }
@@ -1668,13 +1753,13 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
                 m2 = min_all * m;
                 if (rem > 64) rem = 64;
                 for (l = 0; l < 32 && l < rem; l++) {
-                    out[j + jj + l] = d1 * (q[l] & 0xF) - m1;
+                    out[j + jj + l] = clamp_nonfinite(d1 * (float)(q[l] & 0xF) - m1);
                 }
                 if (rem > 32) {
                     int rem2 = rem - 32;
                     if (rem2 > 32) rem2 = 32;
                     for (l = 0; l < rem2; l++) {
-                        out[j + jj + 32 + l] = d2 * (q[l] >> 4) - m2;
+                        out[j + jj + 32 + l] = clamp_nonfinite(d2 * (float)(q[l] >> 4) - m2);
                     }
                 }
                 q += 32;
@@ -1711,9 +1796,9 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
                 for (l = 0; l < 32 && l < rem; l++) {
                     int x0 = (ql[l] & 0x0F) + (qh[l] & u1 ? 16 : 0);
                     int x1 = (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0);
-                    out[j + jj + l + 0] = d1 * (float)x0 - m1;
+                    out[j + jj + l + 0] = clamp_nonfinite(d1 * (float)x0 - m1);
                     if (l + 32 < rem) {
-                        out[j + jj + l + 32] = d2 * (float)x1 - m2;
+                        out[j + jj + l + 32] = clamp_nonfinite(d2 * (float)x1 - m2);
                     }
                 }
                 ql += 32; is += 2;
@@ -1744,10 +1829,10 @@ static void dequantize_row(const Tensor *t, float *out, int row, int d) {
                     int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int q3 = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                     int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    if (l + 0 < rem)  y[l + 0]  = d_all * (float)sc[is + 0] * (float)q1;
-                    if (l + 32 < rem) y[l + 32] = d_all * (float)sc[is + 2] * (float)q2;
-                    if (l + 64 < rem) y[l + 64] = d_all * (float)sc[is + 4] * (float)q3;
-                    if (l + 96 < rem) y[l + 96] = d_all * (float)sc[is + 6] * (float)q4;
+                    if (l + 0 < rem)  y[l + 0]  = clamp_nonfinite(d_all * (float)sc[is + 0] * (float)q1);
+                    if (l + 32 < rem) y[l + 32] = clamp_nonfinite(d_all * (float)sc[is + 2] * (float)q2);
+                    if (l + 64 < rem) y[l + 64] = clamp_nonfinite(d_all * (float)sc[is + 4] * (float)q3);
+                    if (l + 96 < rem) y[l + 96] = clamp_nonfinite(d_all * (float)sc[is + 6] * (float)q4);
                 }
                 y += 128;
                 ql += 64;
@@ -1782,14 +1867,25 @@ static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n,
        GGUF convention is [n, d], so assume standard layout for squares.
        Only use fallback when dims are clearly swapped and non-square. */
     if ((int)t->dims[0] == d && (int)t->dims[1] == n && n != d) {
-        for (i = 0; i < n; i++) {
-            float sum = 0.0f;
-            for (j = 0; j < d; j++) {
-                dequantize_row(t, dq_row, j, n);
-                sum += x[j] * dq_row[i];
-            }
-            y[i] = sum;
+        float *dq_row = (float*)malloc((size_t)n * sizeof(float));
+        int j, v;
+        if (!dq_row) {
+            memset(y, 0, (size_t)n * sizeof(float));
+            return;
         }
+        memset(y, 0, (size_t)n * sizeof(float));
+        for (j = 0; j < d; j++) {
+            float xj = x[j];
+            dequantize_row(t, dq_row, j, n);
+            for (v = 0; v + 3 < n; v += 4) {
+                y[v]     += xj * dq_row[v];
+                y[v + 1] += xj * dq_row[v + 1];
+                y[v + 2] += xj * dq_row[v + 2];
+                y[v + 3] += xj * dq_row[v + 3];
+            }
+            for (; v < n; v++) y[v] += xj * dq_row[v];
+        }
+        free(dq_row);
         return;
     }
     if (t->type == 0) {
@@ -1817,14 +1913,26 @@ static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n,
 }
 
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
-    if (should_parallelize_matvec(n, d) &&
-        (int)t->dims[0] == n && (int)t->dims[1] == d) {
-        matvec_parallel(t, x, y, n, d);
+    if (should_parallelize_matvec(n, d)) {
+        if ((int)t->dims[0] == n && (int)t->dims[1] == d) {
+            matvec_parallel(t, x, y, n, d);
+            return;
+        }
+        if ((int)t->dims[0] == d && (int)t->dims[1] == n && n != d) {
+            matvec_transposed_parallel(t, x, y, n, d);
+            return;
+        }
+    }
+    if ((int)t->dims[0] == d && (int)t->dims[1] == n && n != d) {
+        matvec_no_parallel(t, x, y, n, d, dq_row);
+        return;
+    }
+    if ((int)t->dims[0] == n && (int)t->dims[1] == d) {
+        matvec_no_parallel(t, x, y, n, d, dq_row);
         return;
     }
     matvec_no_parallel(t, x, y, n, d, dq_row);
 }
-
 /* --- Model builder --- */
 
 static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user, int n_kv_user, int hidden_user, int seq_user) {
@@ -1886,19 +1994,37 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     }
     if (m->n_layers == 0) { fprintf(stderr, "Cannot determine layer count\n"); return 1; }
 
+    {
+        Tensor *q0 = find_tensor_f(ctx, "blk.%d.attn_q.weight", 0);
+        Tensor *k0 = find_tensor_f(ctx, "blk.%d.attn_k.weight", 0);
+        Tensor *v0 = find_tensor_f(ctx, "blk.%d.attn_v.weight", 0);
+        if (!q0) q0 = find_tensor(ctx, "model.layers.0.self_attn.q_proj.weight");
+        if (!k0) k0 = find_tensor(ctx, "model.layers.0.self_attn.k_proj.weight");
+        if (!v0) v0 = find_tensor(ctx, "model.layers.0.self_attn.v_proj.weight");
+        m->q_dim = tensor_width(q0, m->dim);
+        m->kv_dim = tensor_width(k0 ? k0 : v0, m->dim);
+        if (m->kv_dim <= 0) m->kv_dim = m->dim;
+    }
+
     if (hp->attention_head_count > 0) m->n_heads = (int)hp->attention_head_count;
     else if (n_heads_user > 0) m->n_heads = n_heads_user;
-    else { fprintf(stderr, "Need --n_heads (not in GGUF metadata)\n"); return 1; }
-    m->head_dim = m->dim / m->n_heads;
+    else if (m->q_dim > 0 && m->kv_dim > 0) {
+        int hd = gcd_int(m->q_dim, m->kv_dim);
+        if (hd > 0) {
+            m->head_dim = hd;
+            m->n_heads = m->q_dim / hd;
+        }
+    }
+    if (m->n_heads == 0) {
+        fprintf(stderr, "Need --n_heads (not in GGUF metadata)\n");
+        return 1;
+    }
+    if (m->head_dim == 0) m->head_dim = m->dim / m->n_heads;
     m->rsqrt_head_dim = 1.0f / (float)sqrt((double)m->head_dim);
 
     if (hp->attention_head_count_kv > 0) m->n_kv_heads = (int)hp->attention_head_count_kv;
     else if (n_kv_user > 0) m->n_kv_heads = n_kv_user;
-    else {
-        t = find_tensor_f(ctx, "blk.%d.attn_k.weight", 0);
-        if (!t) t = find_tensor_f(ctx, "model.layers.%d.self_attn.k_proj.weight", 0);
-        if (t && m->head_dim > 0) m->n_kv_heads = (int)(t->dims[0] / (u64)m->head_dim);
-    }
+    else if (m->kv_dim > 0 && m->head_dim > 0) m->n_kv_heads = m->kv_dim / m->head_dim;
     if (m->n_kv_heads == 0) m->n_kv_heads = m->n_heads;
 
     if (hidden_user > 0) m->hidden_dim = hidden_user;
@@ -1909,6 +2035,9 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         if (t) m->hidden_dim = (int)t->dims[0];
     }
     if (m->hidden_dim == 0) { fprintf(stderr, "Need --hidden (cannot determine)\n"); return 1; }
+
+    if (hp->attention_sliding_window > 0) m->attention_sliding_window = (int)hp->attention_sliding_window;
+    else m->attention_sliding_window = 1024;
 
     if (m->tok_embd_transposed) {
         size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
@@ -1946,6 +2075,8 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     {
         int half = m->head_dim / 2;
         int p, k;
+        float local_theta = m->rope_theta;
+        float global_theta = (m->arch == ARCH_GEMMA3) ? 1000000.0f : m->rope_theta;
         float *cos_tab = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
         float *sin_tab = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
         if (!cos_tab || !sin_tab) {
@@ -1954,7 +2085,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
         for (p = 0; p < m->max_seq_len; p++) {
             for (k = 0; k < half; k++) {
-                float freq = 1.0f / (float)pow((double)m->rope_theta, (double)(k * 2) / (double)m->head_dim);
+                float freq = 1.0f / (float)pow((double)local_theta, (double)(k * 2) / (double)m->head_dim);
                 float val = (float)p * freq;
                 cos_tab[p * half + k] = (float)cos((double)val);
                 sin_tab[p * half + k] = (float)sin((double)val);
@@ -1962,19 +2093,41 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
         m->rope_cos = cos_tab;
         m->rope_sin = sin_tab;
+        if (m->arch == ARCH_GEMMA3 && global_theta != local_theta) {
+            float *gcos = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
+            float *gsin = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
+            if (!gcos || !gsin) {
+                fprintf(stderr, "Failed to allocate Gemma 3 global RoPE tables\n");
+                return 1;
+            }
+            for (p = 0; p < m->max_seq_len; p++) {
+                for (k = 0; k < half; k++) {
+                    float freq = 1.0f / (float)pow((double)global_theta, (double)(k * 2) / (double)m->head_dim);
+                    float val = (float)p * freq;
+                    gcos[p * half + k] = (float)cos((double)val);
+                    gsin[p * half + k] = (float)sin((double)val);
+                }
+            }
+            m->rope_cos_global = gcos;
+            m->rope_sin_global = gsin;
+        }
     }
 
     m->attn_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
+    m->attn_q_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
+    m->attn_k_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->attn_q = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->attn_k = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->attn_v = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->attn_o = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
+    m->post_attn_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
+    m->post_ffn_norm = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_gate = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_up = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
     m->ffn_down = (Tensor**)malloc(sizeof(Tensor*) * m->n_layers);
-    if (!m->attn_norm || !m->attn_q || !m->attn_k || !m->attn_v || !m->attn_o ||
-        !m->ffn_norm || !m->ffn_gate || !m->ffn_up || !m->ffn_down) {
+    if (!m->attn_norm || !m->attn_q_norm || !m->attn_k_norm || !m->attn_q || !m->attn_k || !m->attn_v || !m->attn_o ||
+        !m->ffn_norm || !m->post_attn_norm || !m->post_ffn_norm || !m->ffn_gate || !m->ffn_up || !m->ffn_down) {
         fprintf(stderr, "Failed to allocate layer tensor pointers (out of memory?)\n");
         return 1;
     }
@@ -1982,11 +2135,15 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     for (i = 0; i < m->n_layers; i++) {
         char name[128];
         m->attn_norm[i] = find_tensor_f(ctx, "blk.%d.attn_norm.weight", i);
+        m->attn_q_norm[i] = find_tensor_f(ctx, "blk.%d.attn_q_norm.weight", i);
+        m->attn_k_norm[i] = find_tensor_f(ctx, "blk.%d.attn_k_norm.weight", i);
         m->attn_q[i]    = find_tensor_f(ctx, "blk.%d.attn_q.weight", i);
         m->attn_k[i]    = find_tensor_f(ctx, "blk.%d.attn_k.weight", i);
         m->attn_v[i]    = find_tensor_f(ctx, "blk.%d.attn_v.weight", i);
         m->attn_o[i]    = find_tensor_f(ctx, "blk.%d.attn_output.weight", i);
         m->ffn_norm[i]  = find_tensor_f(ctx, "blk.%d.ffn_norm.weight", i);
+        m->post_attn_norm[i] = find_tensor_f(ctx, "blk.%d.post_attention_norm.weight", i);
+        m->post_ffn_norm[i]  = find_tensor_f(ctx, "blk.%d.post_ffw_norm.weight", i);
         m->ffn_gate[i]  = find_tensor_f(ctx, "blk.%d.ffn_gate.weight", i);
         m->ffn_up[i]    = find_tensor_f(ctx, "blk.%d.ffn_up.weight", i);
         m->ffn_down[i]  = find_tensor_f(ctx, "blk.%d.ffn_down.weight", i);
@@ -1997,6 +2154,8 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         if (!m->attn_v[i]) { sprintf(name, "model.layers.%d.self_attn.v_proj.weight", i); m->attn_v[i] = find_tensor(ctx, name); }
         if (!m->attn_o[i]) { sprintf(name, "model.layers.%d.self_attn.o_proj.weight", i); m->attn_o[i] = find_tensor(ctx, name); }
         if (!m->ffn_norm[i]) { sprintf(name, "model.layers.%d.post_attention_layernorm.weight", i); m->ffn_norm[i] = find_tensor(ctx, name); }
+        if (!m->post_attn_norm[i]) { sprintf(name, "model.layers.%d.post_attention_norm.weight", i); m->post_attn_norm[i] = find_tensor(ctx, name); }
+        if (!m->post_ffn_norm[i]) { sprintf(name, "model.layers.%d.post_ffw_norm.weight", i); m->post_ffn_norm[i] = find_tensor(ctx, name); }
         if (!m->ffn_gate[i]) { sprintf(name, "model.layers.%d.mlp.gate_proj.weight", i); m->ffn_gate[i] = find_tensor(ctx, name); }
         if (!m->ffn_up[i]) { sprintf(name, "model.layers.%d.mlp.up_proj.weight", i); m->ffn_up[i] = find_tensor(ctx, name); }
         if (!m->ffn_down[i]) { sprintf(name, "model.layers.%d.mlp.down_proj.weight", i); m->ffn_down[i] = find_tensor(ctx, name); }
@@ -2114,8 +2273,10 @@ static void free_model(Model *m) {
     if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
     if (m->rope_cos)   { free(m->rope_cos);   m->rope_cos = NULL; }
     if (m->rope_sin)   { free(m->rope_sin);   m->rope_sin = NULL; }
-    free(m->attn_norm); free(m->attn_q); free(m->attn_k); free(m->attn_v); free(m->attn_o);
-    free(m->ffn_norm); free(m->ffn_gate); free(m->ffn_up); free(m->ffn_down);
+    if (m->rope_cos_global) { free(m->rope_cos_global); m->rope_cos_global = NULL; }
+    if (m->rope_sin_global) { free(m->rope_sin_global); m->rope_sin_global = NULL; }
+    free(m->attn_norm); free(m->attn_q_norm); free(m->attn_k_norm); free(m->attn_q); free(m->attn_k); free(m->attn_v); free(m->attn_o);
+    free(m->ffn_norm); free(m->post_attn_norm); free(m->post_ffn_norm); free(m->ffn_gate); free(m->ffn_up); free(m->ffn_down);
 }
 
 static int alloc_runstate(Model *m, RunState *s, GGUFContext *ctx) {
@@ -2125,26 +2286,31 @@ static int alloc_runstate(Model *m, RunState *s, GGUFContext *ctx) {
     int n_layers = m->n_layers;
     int n_kv_heads = m->n_kv_heads;
     int head_dim = m->head_dim;
+    int q_dim = m->q_dim > 0 ? m->q_dim : dim;
+    int kv_dim = m->kv_dim > 0 ? m->kv_dim : (n_kv_heads * head_dim);
     int max_seq_len = m->max_seq_len;
     int kv_size = n_layers * n_kv_heads * max_seq_len * head_dim;
     int max_d = dim;
+    if (q_dim > max_d) max_d = q_dim;
+    if (kv_dim > max_d) max_d = kv_dim;
     if (hidden_dim > max_d) max_d = hidden_dim;
     if (vocab_size > max_d) max_d = vocab_size;
 
     printf("Allocating run state...\n");
-    printf("  x/q/attn_out/tmp: %u bytes each\n", (unsigned int)(dim * sizeof(float)));
-    printf("  k/v per head: %u bytes each\n", (unsigned int)(n_kv_heads * head_dim * sizeof(float)));
+    printf("  x: %u bytes\n", (unsigned int)(dim * sizeof(float)));
+    printf("  q/attn_out: %u bytes each\n", (unsigned int)(q_dim * sizeof(float)));
+    printf("  k/v total: %u bytes each\n", (unsigned int)(kv_dim * sizeof(float)));
     printf("  ffn_gate/up/hidden: %u bytes each\n", (unsigned int)(hidden_dim * sizeof(float)));
     printf("  logits: %u bytes\n", (unsigned int)(vocab_size * sizeof(float)));
     printf("  k_cache+v_cache: %u bytes\n", (unsigned int)(kv_size * sizeof(float) * 2));
     printf("  dq_row: %u bytes\n", (unsigned int)(max_d * sizeof(float)));
-    printf("  Total state: ~%u KB\n", (unsigned int)((dim*5 + n_kv_heads*head_dim*2 + hidden_dim*3 + vocab_size + kv_size*2 + max_seq_len + max_d) * sizeof(float) / 1024));
+    printf("  Total state: ~%u KB\n", (unsigned int)((dim + q_dim*2 + kv_dim*2 + hidden_dim*3 + vocab_size + kv_size*2 + max_seq_len + max_d) * sizeof(float) / 1024));
 
     s->x = (float*)malloc(dim * sizeof(float));
-    s->q = (float*)malloc(dim * sizeof(float));
-    s->k = (float*)malloc(n_kv_heads * head_dim * sizeof(float));
-    s->v = (float*)malloc(n_kv_heads * head_dim * sizeof(float));
-    s->attn_out = (float*)malloc(dim * sizeof(float));
+    s->q = (float*)malloc(q_dim * sizeof(float));
+    s->k = (float*)malloc(kv_dim * sizeof(float));
+    s->v = (float*)malloc(kv_dim * sizeof(float));
+    s->attn_out = (float*)malloc(q_dim * sizeof(float));
     s->ffn_gate = (float*)malloc(hidden_dim * sizeof(float));
     s->ffn_up = (float*)malloc(hidden_dim * sizeof(float));
     s->ffn_hidden = (float*)malloc(hidden_dim * sizeof(float));
@@ -2192,16 +2358,19 @@ static void free_runstate(RunState *s) {
 
 /* --- Forward pass --- */
 
-static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, float top_p, float min_p, int *recent, int recent_n, int ban_token) {
+static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, float top_p, float min_p, int *recent, int recent_n, int ban_token, int compute_logits) {
     int dim = m->dim;
     int hidden_dim = m->hidden_dim;
     int n_layers = m->n_layers;
     int n_heads = m->n_heads;
     int n_kv_heads = m->n_kv_heads;
     int head_dim = m->head_dim;
+    int q_dim = m->q_dim > 0 ? m->q_dim : dim;
+    int kv_dim = m->kv_dim > 0 ? m->kv_dim : n_kv_heads * head_dim;
     int max_seq_len = m->max_seq_len;
     int vocab_size = m->vocab_size;
     int q_per_kv = n_heads / n_kv_heads;
+    int is_gemma3 = (m->arch == ARCH_GEMMA3);
     int l, h, h_kv, t, i;
     float *x = s->x;
     float *tmp = s->tmp;
@@ -2225,18 +2394,50 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
     } else {
         dequantize_row(m->tok_embd, x, token, dim);
     }
+    if (m->arch == ARCH_GEMMA3 && !g_clean_output && vector_has_nan(x, dim)) {
+        printf("Gemma3 debug: NaN in token embedding for token %d\n", token);
+    }
 
     for (l = 0; l < n_layers; l++) {
+        int is_global_layer = is_gemma3 && (((l + 1) % 6) == 0);
+        int attn_start = 0;
+        const float *rope_cos = m->rope_cos;
+        const float *rope_sin = m->rope_sin;
         /* Attention */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
         rmsnorm(x, (float*)m->attn_norm[l]->data, dim, m->norm_eps);
 
-        matvec(m->attn_q[l], x, q, dim, dim, s->dq_row);
-        matvec(m->attn_k[l], x, k, n_kv_heads * head_dim, dim, s->dq_row);
-        matvec(m->attn_v[l], x, v, n_kv_heads * head_dim, dim, s->dq_row);
+        matvec(m->attn_q[l], x, q, q_dim, dim, s->dq_row);
+        matvec(m->attn_k[l], x, k, kv_dim, dim, s->dq_row);
+        matvec(m->attn_v[l], x, v, kv_dim, dim, s->dq_row);
+        if (is_gemma3 && !g_clean_output && l == 0) {
+            if (vector_has_nan(q, q_dim)) printf("Gemma3 debug: NaN in q after attn_q\n");
+            if (vector_has_nan(k, kv_dim)) printf("Gemma3 debug: NaN in k after attn_k\n");
+            if (vector_has_nan(v, kv_dim)) printf("Gemma3 debug: NaN in v after attn_v\n");
+        }
 
-        for (h = 0; h < n_heads; h++) rope_1d(q + h * head_dim, head_dim, pos, m->rope_cos, m->rope_sin);
-        for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rope_1d(k + h_kv * head_dim, head_dim, pos, m->rope_cos, m->rope_sin);
+        if (is_gemma3) {
+            if (m->attn_q_norm[l] && m->attn_q_norm[l]->data) {
+                for (h = 0; h < n_heads; h++) rmsnorm(q + h * head_dim, (float*)m->attn_q_norm[l]->data, head_dim, m->norm_eps);
+            }
+            if (m->attn_k_norm[l] && m->attn_k_norm[l]->data) {
+                for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rmsnorm(k + h_kv * head_dim, (float*)m->attn_k_norm[l]->data, head_dim, m->norm_eps);
+            }
+            if (!g_clean_output && l == 0) {
+                if (vector_has_nan(q, q_dim)) printf("Gemma3 debug: NaN in q after q_norm\n");
+                if (vector_has_nan(k, kv_dim)) printf("Gemma3 debug: NaN in k after k_norm\n");
+            }
+            if (is_global_layer && m->rope_cos_global && m->rope_sin_global) {
+                rope_cos = m->rope_cos_global;
+                rope_sin = m->rope_sin_global;
+            } else if (!is_global_layer) {
+                int window = m->attention_sliding_window > 0 ? m->attention_sliding_window : 1024;
+                attn_start = pos > window - 1 ? pos - (window - 1) : 0;
+            }
+        }
+
+        for (h = 0; h < n_heads; h++) rope_1d(q + h * head_dim, head_dim, pos, rope_cos, rope_sin);
+        for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rope_1d(k + h_kv * head_dim, head_dim, pos, rope_cos, rope_sin);
 
         for (h_kv = 0; h_kv < n_kv_heads; h_kv++) {
             float *kc = k_cache + ((l * n_kv_heads + h_kv) * max_seq_len + pos) * head_dim;
@@ -2258,7 +2459,7 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
             float *q_head = q + h * head_dim;
             float *out_head = attn_out + h * head_dim;
             h_kv = h / q_per_kv;
-            for (t = 0; t <= pos; t++) {
+            for (t = attn_start; t <= pos; t++) {
                 float *kt = k_cache + ((l * n_kv_heads + h_kv) * max_seq_len + t) * head_dim;
                 float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, score;
                 for (i = 0; i + 3 < head_dim; i += 4) {
@@ -2273,13 +2474,13 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
                 attn_scores[t] = score;
                 if (score > max_score) max_score = score;
             }
-            for (t = 0; t <= pos; t++) {
+            for (t = attn_start; t <= pos; t++) {
                 attn_scores[t] = fast_exp_table(attn_scores[t] - max_score);
                 sum_score += attn_scores[t];
             }
-            for (t = 0; t <= pos; t++) attn_scores[t] /= sum_score;
+            for (t = attn_start; t <= pos; t++) attn_scores[t] /= sum_score;
             for (i = 0; i < head_dim; i++) out_head[i] = 0.0f;
-            for (t = 0; t <= pos; t++) {
+            for (t = attn_start; t <= pos; t++) {
                 float *vt = v_cache + ((l * n_kv_heads + h_kv) * max_seq_len + t) * head_dim;
                 float score = attn_scores[t];
                 for (i = 0; i + 3 < head_dim; i += 4) {
@@ -2291,9 +2492,11 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
                 for (; i < head_dim; i++) out_head[i] += score * vt[i];
             }
         }
-
-        matvec(m->attn_o[l], attn_out, x, dim, dim, s->dq_row);
+        matvec(m->attn_o[l], attn_out, x, dim, q_dim, s->dq_row);
         for (i = 0; i < dim; i++) x[i] += tmp[i];
+        if (is_gemma3 && m->post_attn_norm[l] && m->post_attn_norm[l]->data) {
+            rmsnorm(x, (float*)m->post_attn_norm[l]->data, dim, m->norm_eps);
+        }
 
         /* FFN */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
@@ -2305,7 +2508,12 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 
         matvec(m->ffn_down[l], s->ffn_hidden, x, dim, hidden_dim, s->dq_row);
         for (i = 0; i < dim; i++) x[i] += tmp[i];
+        if (is_gemma3 && m->post_ffn_norm[l] && m->post_ffn_norm[l]->data) {
+            rmsnorm(x, (float*)m->post_ffn_norm[l]->data, dim, m->norm_eps);
+        }
     }
+
+    if (!compute_logits) return 0;
 
     rmsnorm(x, (float*)m->output_norm->data, dim, m->norm_eps);
     if (m->cached_output) {
@@ -2335,6 +2543,32 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
     } else {
         matvec(m->output, x, s->logits, vocab_size, dim, s->dq_row);
+    }
+    if (m->arch == ARCH_GEMMA3 && !g_clean_output && ban_token >= 0) {
+        int best[5];
+        float bestv[5];
+        int bi, bj;
+        for (bi = 0; bi < 5; bi++) { best[bi] = -1; bestv[bi] = -1e30f; }
+        for (bi = 0; bi < vocab_size; bi++) {
+            float v0 = s->logits[bi];
+            for (bj = 0; bj < 5; bj++) {
+                if (v0 > bestv[bj]) {
+                    int kk;
+                    for (kk = 4; kk > bj; kk--) {
+                        bestv[kk] = bestv[kk - 1];
+                        best[kk] = best[kk - 1];
+                    }
+                    bestv[bj] = v0;
+                    best[bj] = bi;
+                    break;
+                }
+            }
+        }
+        printf("Gemma3 logits top5:");
+        for (bi = 0; bi < 5; bi++) {
+            if (best[bi] >= 0) printf(" %d=%.4f", best[bi], bestv[bi]);
+        }
+        printf("\n");
     }
     /* Repetition penalty: discourage recent tokens */
     if (recent && recent_n > 0) {
@@ -3211,6 +3445,8 @@ int main(int argc, char **argv) {
         printf("  Head count: %u\n", (unsigned int)ctx->hp.attention_head_count);
         printf("  KV head count: %u\n", (unsigned int)ctx->hp.attention_head_count_kv);
         printf("  FFN length: %u\n", (unsigned int)ctx->hp.feed_forward_length);
+        printf("  Sliding window: %u\n", (unsigned int)ctx->hp.attention_sliding_window);
+        printf("  Rope freq base: %.0f\n", (double)ctx->hp.rope_freq_base);
         gguf_free(ctx);
         return 0;
     }
@@ -3219,19 +3455,26 @@ int main(int argc, char **argv) {
     gemma3_mode = (m.arch == ARCH_GEMMA3) ||
                   contains_nocase(model_path, "gemma3") ||
                   contains_nocase(hp.chat_template, "start_of_turn");
+    {
+        int gemma3_270m_mode = contains_nocase(model_path, "gemma-3-270m") ||
+                               contains_nocase(model_path, "gemma3-270m");
+        if (gemma3_270m_mode || m.arch == ARCH_GEMMA3) {
+            if (!temp_user) temp = 1.0f;
+            if (!top_k_user) top_k = 64;
+            if (!top_p_user) top_p = 0.95f;
+            if (!min_p_user) min_p = 0.0f;
+            if (!g_clean_output) {
+                printf("Gemma3 sampler defaults: temp=%.1f top_k=%d top_p=%.2f min_p=%.1f\n",
+                       temp, top_k, top_p, min_p);
+            }
+        }
+    }
     smollm2_mode = contains_nocase(model_path, "smollm2") ||
                    contains_nocase(hp.tokenizer_pre, "smollm") ||
                    contains_nocase(hp.chat_template, "SmolLM");
     slopllm_mode = contains_nocase(model_path, "slopllm") ||
                    contains_nocase(hp.chat_template, "SlopLLM") ||
                    contains_nocase(hp.chat_template, "SlopAI");
-
-    if (m.arch == ARCH_GEMMA3) {
-        if (!temp_user) temp = 1.0f;
-        if (!top_k_user) top_k = 64;
-        if (!top_p_user) top_p = 0.95f;
-        if (!min_p_user) min_p = 0.0f;
-    }
 
     load_tokenizer_auto(model_path, tok_path, ctx);
 
@@ -3277,36 +3520,53 @@ int main(int argc, char **argv) {
     prompt_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
 
     /* Build prompt tokens */
-    if (smollm2_mode || tinyllama_mode || gemma3_mode || slopllm_mode || do_chat) {
-        int tok_bos = find_special_token("<bos>");
+    {
         int tok_im_start = find_special_token("<|im_start|>");
         int tok_im_end = find_special_token("<|im_end|>");
+        int tok_bos = find_special_token("<bos>");
+        int prompt_has_template =
+            contains_nocase(prompt, "<start_of_turn>") ||
+            contains_nocase(prompt, "<|im_start|>") ||
+            contains_nocase(prompt, "[INST]") ||
+            contains_nocase(prompt, "user:");
         int n = 0;
+        int wrapped_prompt = 0;
 
-        if (smollm2_mode) {
+        if (!do_chat && !smollm2_mode && !tinyllama_mode && !gemma3_mode && !slopllm_mode) {
+            prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
+        } else if (!do_chat && prompt_has_template) {
+            if (!g_clean_output) printf("Prompt already looks templated; using raw prompt text\n");
+            prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
+        } else if (smollm2_mode) {
+            wrapped_prompt = 1;
             if (!g_clean_output) printf("Chat tokens: smollm2 ChatML style\n");
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_start|>user\n", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_end|>\n", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<|im_start|>assistant\n", m.vocab_size);
         } else if (gemma3_mode) {
+            wrapped_prompt = 1;
             if (!g_clean_output) printf("Chat tokens: gemma3 start_of_turn style\n");
             if (tok_bos >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_bos;
+            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>system\nYou are a helpful assistant. Answer clearly and directly.\n<end_of_turn>\n", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>user\n", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<end_of_turn>\n", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>model\n", m.vocab_size);
         } else if (tinyllama_mode) {
+            wrapped_prompt = 1;
             if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<s>[INST] ", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " [/INST]", m.vocab_size);
         } else if (slopllm_mode) {
+            wrapped_prompt = 1;
             if (!g_clean_output) printf("Chat tokens: slopllm user/assistant style\n");
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "user: ", m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
             n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " assistant:", m.vocab_size);
         } else {
+            wrapped_prompt = 1;
             int tmp_tok[256];
             int tmp_n;
             if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
@@ -3346,9 +3606,7 @@ int main(int argc, char **argv) {
             for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
         }
 
-        prompt_len = n;
-    } else {
-        prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
+        if (wrapped_prompt) prompt_len = n;
     }
 
     /* Debug: show first 30 prompt tokens */
@@ -3375,7 +3633,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
     for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
-        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1);
+        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
         if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
             printf(".");
             fflush(stdout);
@@ -3385,11 +3643,11 @@ int main(int argc, char **argv) {
     /* Last prompt token produces first generated token using sampling */
     if (prompt_len > 1 && !g_clean_output) printf("\n");
     if (prompt_len > 0) {
-        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, eos_token);
+        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, eos_token, 1);
         pos = prompt_len;
     } else {
         /* Empty prompt: use BOS token as seed */
-        next_token = forward(&m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, eos_token);
+        next_token = forward(&m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, eos_token, 1);
         pos = 1;
     }
 
@@ -3413,7 +3671,7 @@ int main(int argc, char **argv) {
         }
         for (i = 1; i < n_generate; i++) {
             if (pos >= m.max_seq_len) break;
-            next_token = forward(&m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, -1);
+            next_token = forward(&m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, -1, 1);
             pos++;
             if (!do_raw_tokens && next_token == 0) break;
             if (next_token == eos_token && !no_eos_stop) break;
@@ -3453,3 +3711,4 @@ int main(int argc, char **argv) {
     if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
     return 0;
 }
+
