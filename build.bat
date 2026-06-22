@@ -1,5 +1,5 @@
 @echo off
-REM Build gguf_infer.exe.
+REM Build spermC.exe.
 REM Works with cl.exe when the MSVC environment is already initialized.
 
 setlocal
@@ -18,16 +18,16 @@ echo Build failed. Install Visual C++ or MinGW GCC and make sure it is on PATH.
 goto :done
 
 :build_cl
-cl /nologo /O2 /Ob2 /MT /W3 /TC /D_CRT_SECURE_NO_WARNINGS /Fe:gguf_infer.exe gguf_infer.c
+cl /nologo /O2 /Ob2 /MT /W3 /TC /D_CRT_SECURE_NO_WARNINGS /Fe:spermC.exe gguf_infer.c
 if errorlevel 1 goto :error
 goto :success
 
 :build_gcc
-gcc -O3 -march=native -mtune=native -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o gguf_infer.exe gguf_infer.c -lm
+gcc -O3 -march=native -mtune=native -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o spermC.exe gguf_infer.c -lm
 if errorlevel 1 goto :error
 
 :success
-echo Build successful: gguf_infer.exe
+echo Build successful: spermC.exe
 goto :done
 
 :error
