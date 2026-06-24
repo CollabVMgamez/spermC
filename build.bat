@@ -23,7 +23,9 @@ if errorlevel 1 goto :error
 goto :success
 
 :build_gcc
-gcc -O3 -march=native -mtune=native -funroll-loops -std=c99 -Wall -Wextra -Wno-unused-parameter -o spermC.exe gguf_infer.c -lm
+REM Keep GCC builds compatible with Windows 2000-era x86 CPUs while still generating
+REM decent code for the tight matvec/dequant loops.
+gcc -O2 -fomit-frame-pointer -fno-strict-aliasing -march=i686 -mtune=generic -std=c99 -Wall -Wextra -Wno-unused-parameter -o spermC.exe gguf_infer.c -lm
 if errorlevel 1 goto :error
 
 :success
