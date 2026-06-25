@@ -126,6 +126,7 @@ typedef struct {
     u32 tokenizer_eos_token_id;
     u32 tokenizer_padding_token_id;
     int tokenizer_add_bos_token;
+    int tokenizer_add_space_prefix;
     char architecture[32];
     char tokenizer_model[32];
     char tokenizer_pre[32];
@@ -211,8 +212,13 @@ static int g_sorted_init = 0;
 static void reset_byte_token_map(void);
 static int g_clean_output = 0;
 static int g_n_threads = 0;
+static int g_allow_eog_sampling = 0;
+static int g_interactive_ui = 0;
 static int g_tokenizer_is_gpt2 = 0;
+static int g_gpt2_add_space_prefix = 0;
 static int g_legacy_windows = -1;
+static int g_eog_tokens[8];
+static int g_eog_token_count = 0;
 static StrIdEntry *g_token_lookup = NULL;
 static int g_token_lookup_cap = 0;
 static BpePairEntry *g_bpe_pairs = NULL;
@@ -223,6 +229,9 @@ static int g_gpt2_codepoint_to_byte[65536];
 static int probe_tensor_section(const u8 *base, size_t size, u64 offset, u64 tensor_count);
 static int is_legacy_windows(void);
 static void gguf_free(GGUFContext *ctx);
+static void print_token_text_clean(const char *text, int len);
+
+#define MATVEC_POOL_MAX_THREADS 8
 
 static int contains_nocase(const char *haystack, const char *needle) {
     size_t nlen, i;
@@ -723,6 +732,7 @@ static int match_special_token_text(const char *text, int len, int *token_id) {
 static int tokenize_gpt2_chunk(const char *text, int len, int *tokens, int max_tokens) {
     int i, n;
     int *ids;
+    static int warned_missing_byte = 0;
     if (!text || len <= 0 || !tokens || max_tokens <= 0) return 0;
     ids = (int*)malloc((size_t)len * sizeof(int));
     if (!ids) return -1;
@@ -731,7 +741,14 @@ static int tokenize_gpt2_chunk(const char *text, int len, int *tokens, int max_t
         unsigned char c = (unsigned char)text[i];
         int byte_id = g_gpt2_byte_token[c];
         if (byte_id < 0) byte_id = g_byte_token[c];
-        if (byte_id < 0) byte_id = c;
+        if (byte_id < 0) {
+            if (!warned_missing_byte) {
+                fprintf(stderr, "Error: GPT2 tokenizer is missing byte token mappings; refusing to inject raw token IDs\n");
+                warned_missing_byte = 1;
+            }
+            free(ids);
+            return -1;
+        }
         ids[n++] = byte_id;
     }
     if (g_bpe_pair_count > 0) {
@@ -762,8 +779,26 @@ static int tokenize_gpt2_chunk(const char *text, int len, int *tokens, int max_t
 
 static int tokenize_gpt2(const char *text, int *tokens, int max_tokens) {
     int len, pos, n;
+    int needs_prefix_space = 0;
+    const char *scan;
     if (!text || !tokens || max_tokens <= 0) return 0;
     if (!g_tokenizer_is_gpt2 || !g_vocab || !g_token_lookup) return -1;
+    scan = text;
+    while (*scan == '\r' || *scan == '\n' || *scan == '\t' || *scan == ' ') scan++;
+    if (g_gpt2_add_space_prefix && *scan && *scan != '<' &&
+        text[0] != ' ' && text[0] != '\t' && text[0] != '\r' && text[0] != '\n') {
+        needs_prefix_space = 1;
+    }
+    if (needs_prefix_space) {
+        char *tmp = (char*)malloc(strlen(text) + 2);
+        int out_n;
+        if (!tmp) return -1;
+        tmp[0] = ' ';
+        strcpy(tmp + 1, text);
+        out_n = tokenize_gpt2(tmp, tokens, max_tokens);
+        free(tmp);
+        return out_n;
+    }
     len = (int)strlen(text);
     pos = 0;
     n = 0;
@@ -856,7 +891,11 @@ static void detokenize_gpt2(int token) {
         int byte = -1;
         if (cp < 65536) byte = g_gpt2_codepoint_to_byte[cp];
         if (byte < 0) byte = (int)(unsigned char)text[pos];
-        putchar((char)byte);
+        if (byte == '\n' || byte == '\r' || byte == '\t' || (byte >= 32 && byte < 127)) {
+            putchar((char)byte);
+        } else if (byte == ' ') {
+            putchar(' ');
+        }
         pos += used > 0 ? used : 1;
     }
 }
@@ -876,6 +915,7 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
     g_sorted_init = 0;
     free_gpt2_tokenizer_tables();
     reset_byte_token_map();
+    g_gpt2_add_space_prefix = 0;
     if (memcmp(p, "GGUF", 4) != 0) return 0;
     p += 4;
     read_u32(&p); /* version */
@@ -926,7 +966,7 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
                     tok_buf_size++;
                     p += slen;
                 }
-                printf("Loaded tokenizer from GGUF: %d tokens\n", g_vocab_n);
+        if (!g_clean_output) printf("Loaded tokenizer from GGUF: %d tokens\n", g_vocab_n);
                 rebuild_byte_token_map();
             }
         } else if (want_gpt2 && strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == 9) {
@@ -970,6 +1010,7 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
     }
     if (g_vocab && want_gpt2) {
         g_tokenizer_is_gpt2 = 1;
+        g_gpt2_add_space_prefix = ctx->hp.tokenizer_add_space_prefix;
         if (!build_gpt2_tokenizer_tables()) {
             free((void*)merge_texts);
             free(merge_lens);
@@ -984,7 +1025,7 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
                 return 0;
             }
         }
-        printf("Loaded GPT2 tokenizer from GGUF: %d tokens, %d merges\n", g_vocab_n, g_bpe_pair_count);
+        if (!g_clean_output) printf("Loaded GPT2 tokenizer from GGUF: %d tokens, %d merges\n", g_vocab_n, g_bpe_pair_count);
         free((void*)merge_texts);
         free(merge_lens);
         free(merge_buf);
@@ -1123,6 +1164,8 @@ static void parse_metadata(u8 **p, u64 n_kv, HParams *hp) {
             if (!read_meta_u32_value(vtype, p, &hp->tokenizer_padding_token_id)) skip_value(vtype, p);
         } else if (strcmp(key, "tokenizer.ggml.add_bos_token") == 0) {
             if (!read_meta_bool_value(vtype, p, &hp->tokenizer_add_bos_token)) skip_value(vtype, p);
+        } else if (strcmp(key, "tokenizer.ggml.add_space_prefix") == 0) {
+            if (!read_meta_bool_value(vtype, p, &hp->tokenizer_add_space_prefix)) skip_value(vtype, p);
         } else if (strcmp(key, "general.architecture") == 0 && vtype == 8) {
             u64 slen_full = read_u64(p);
             u64 slen = slen_full;
@@ -1187,7 +1230,7 @@ static GGUFContext *gguf_load(const char *path) {
                 sizeLow = GetFileSize(hFile, &sizeHigh);
                 if (sizeLow != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
                     file_size = ((u64)sizeHigh << 32) | (u64)sizeLow;
-                    printf("Loading %s (%.1f MB) via memory map...\n", path, (double)file_size / (1024.0*1024.0));
+                    if (!g_clean_output) printf("Loading %s (%.1f MB) via memory map...\n", path, (double)file_size / (1024.0*1024.0));
                     hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
                     if (hMapping) {
                         ctx->base = (u8*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
@@ -1197,11 +1240,11 @@ static GGUFContext *gguf_load(const char *path) {
                             ctx->size = (size_t)file_size;
                             goto loaded;
                         }
-                        printf("Warning: MapViewOfFile failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
+                        if (!g_clean_output) printf("Warning: MapViewOfFile failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
                         CloseHandle(hMapping);
                     }
                     else {
-                        printf("Warning: CreateFileMapping failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
+                        if (!g_clean_output) printf("Warning: CreateFileMapping failed (error %lu), falling back to fread\n", (unsigned long)GetLastError());
                     }
                 }
                 CloseHandle(hFile);
@@ -1215,7 +1258,7 @@ static GGUFContext *gguf_load(const char *path) {
     fseek(f, 0, SEEK_END);
     file_size = (u64)ftell(f);
     fseek(f, 0, SEEK_SET);
-    printf("Loading %s (%.1f MB) via fread...\n", path, (double)file_size / (1024.0*1024.0));
+    if (!g_clean_output) printf("Loading %s (%.1f MB) via fread...\n", path, (double)file_size / (1024.0*1024.0));
     ctx->size = (size_t)file_size;
     ctx->base = (u8*)malloc((size_t)file_size);
     if (!ctx->base) { printf("Error: cannot allocate %.1f MB for model file (out of memory?)\n", (double)file_size / (1024.0*1024.0)); free(ctx); fclose(f); return NULL; }
@@ -1227,7 +1270,7 @@ loaded:
     p = ctx->base;
     if (memcmp(p, "GGUF", 4) != 0) { printf("Error: not a GGUF file\n"); free(ctx->base); free(ctx); return NULL; }
     p += 4;
-    if (read_u32(&p) != 3) { printf("Warning: GGUF version != 3\n"); }
+    if (read_u32(&p) != 3) { if (!g_clean_output) printf("Warning: GGUF version != 3\n"); }
     tensor_count = read_u64(&p);
     meta_count = read_u64(&p);
     if (tensor_count == 0 || tensor_count > 1000000) {
@@ -1260,8 +1303,10 @@ loaded:
             }
         }
         if (found) {
-            printf("Tensor section found at offset %u (parser was at %u)\n",
-                   (unsigned int)(found - ctx->base), (unsigned int)(p - ctx->base));
+            if (!g_clean_output) {
+                printf("Tensor section found at offset %u (parser was at %u)\n",
+                       (unsigned int)(found - ctx->base), (unsigned int)(p - ctx->base));
+            }
             p = found;
         }
     }
@@ -1301,7 +1346,8 @@ loaded:
             free(ctx);
             return NULL;
         }
-        for (j = 0; j < 4; j++) t->dims[j] = (j < t->n_dims) ? read_u64(&p) : 1;
+        for (j = 0; j < t->n_dims; j++) t->dims[j] = read_u64(&p);
+        for (; j < 4; j++) t->dims[j] = 1;
         if (p + 4 > file_end) {
             printf("Error: truncated tensor type at index %llu\n", (unsigned long long)i);
             free(ctx->tensors);
@@ -1617,6 +1663,12 @@ static float clamp_nonfinite(float v) {
 static int sample_topk(float *logits, int n, float temp, int top_k, float top_p, float min_p, int ban_token) {
     int i, k;
     float maxv, sum, r, cdf;
+    if (!g_allow_eog_sampling) {
+        for (i = 0; i < g_eog_token_count; i++) {
+            int tok = g_eog_tokens[i];
+            if (tok >= 0 && tok < n) logits[tok] = -1e30f;
+        }
+    }
     if (ban_token >= 0 && ban_token < n) logits[ban_token] = -1e30f;
     if (temp == 0.0f) {
         int best = 0;
@@ -1760,8 +1812,8 @@ static int tensor_row_count_for_width(const Tensor *t, int row_width) {
         return row_width == a ? 1 : a;
     }
     if (a <= 0 || b <= 0 || row_width <= 0) return 0;
-    if (b == row_width) return a;
     if (a == row_width) return b;
+    if (b == row_width) return a;
     return 0;
 }
 
@@ -1772,8 +1824,8 @@ static int cache_tensor_f32_inplace(Tensor *t) {
     size_t bytes;
 
     if (!t || t->type == 0) return 1;
-    n = (int)t->dims[0];
-    d = (int)t->dims[1];
+    d = (int)t->dims[0];
+    n = (int)t->dims[1];
     if (n <= 0 || d <= 0) return 0;
     bytes = (size_t)n * (size_t)d * sizeof(float);
     buf = (float*)malloc(bytes);
@@ -1869,7 +1921,7 @@ static float *cache_tensor_logical_f32(const Tensor *t, int n, int d) {
         free(row);
         return NULL;
     }
-    if ((int)t->dims[0] == n && (int)t->dims[1] == d) {
+    if ((int)t->dims[0] == d && (int)t->dims[1] == n) {
         for (i = 0; i < n; i++) {
             dequantize_row(t, row, i, d);
             memcpy(buf + (size_t)i * (size_t)d, row, (size_t)d * sizeof(float));
@@ -1889,13 +1941,13 @@ static float *cache_tensor_logical_f32(const Tensor *t, int n, int d) {
 static int cache_tensor_f32_logical_inplace(Tensor *t, int n, int d) {
     float *buf;
     if (!t) return 0;
-    if (t->type == 0 && (int)t->dims[0] == n && (int)t->dims[1] == d) return 1;
+    if (t->type == 0 && (int)t->dims[0] == d && (int)t->dims[1] == n) return 1;
     buf = cache_tensor_logical_f32(t, n, d);
     if (!buf) return 0;
     t->data = buf;
     t->type = 0;
-    t->dims[0] = (u64)n;
-    t->dims[1] = (u64)d;
+    t->dims[0] = (u64)d;
+    t->dims[1] = (u64)n;
     return 1;
 }
 
@@ -1923,8 +1975,8 @@ static int cache_tensor_f32_force_transpose_inplace(Tensor *t, int n, int d) {
     free(row);
     t->data = buf;
     t->type = 0;
-    t->dims[0] = (u64)n;
-    t->dims[1] = (u64)d;
+    t->dims[0] = (u64)d;
+    t->dims[1] = (u64)n;
     return 1;
 }
 
@@ -2087,8 +2139,8 @@ static u64 tensor_storage_bytes(const Tensor *t) {
     u64 rows, cols;
     u64 bytes_a, bytes_b;
     if (!t) return 0;
-    rows = t->dims[0];
-    cols = t->dims[1];
+    rows = t->dims[1];
+    cols = t->dims[0];
     if (t->n_dims == 1) cols = 1;
     if (rows == 0 || cols == 0) return 0;
     switch (t->type) {
@@ -2547,7 +2599,7 @@ static int should_parallelize_matvec(int n, int d) {
 static int pick_matvec_threads(int n, int d) {
     u64 work = (u64)n * (u64)d;
     int thread_count = g_n_threads;
-    if (thread_count > 8) thread_count = 8;
+    if (thread_count > MATVEC_POOL_MAX_THREADS) thread_count = MATVEC_POOL_MAX_THREADS;
     if (thread_count > n) thread_count = n;
     if (is_legacy_windows()) {
         if (thread_count > 4) thread_count = 4;
@@ -2556,9 +2608,10 @@ static int pick_matvec_threads(int n, int d) {
         if (thread_count < 1) thread_count = 1;
         return thread_count;
     }
-    /* Keep tiny matrices serial. Use 4 threads for mid-sized work and
-       allow 8 threads once the matrix is big enough to amortize the
-       extra synchronization. */
+    /* Keep tiny matrices serial. Use fewer threads for mid-sized work and
+       allow the full pool once the matrix is large enough to amortize the
+       synchronization cost. */
+    if (work < 250000ULL) thread_count = 1;
     if (work < 600000ULL && thread_count > 4) thread_count = 4;
     if (work < 250000ULL) thread_count = 1;
     if (thread_count < 1) thread_count = 1;
@@ -2575,8 +2628,6 @@ typedef struct {
     int n;
     int d;
 } MatvecThreadWork;
-
-#define MATVEC_POOL_MAX_THREADS 8
 
 typedef struct {
     int index;
@@ -2624,7 +2675,9 @@ static unsigned __stdcall matvec_pool_thread(void *arg) {
             if (rows > 0) {
                 Tensor sub_t = *job.t;
                 sub_t.data = (u8*)job.t->data + (size_t)start * job.row_bytes;
-                sub_t.dims[0] = (u64)rows;
+                sub_t.dims[0] = (u64)job.d;
+                sub_t.dims[1] = (u64)rows;
+                sub_t.size_bytes = (u64)rows * (u64)job.row_bytes;
                 matvec_no_parallel(&sub_t, job.x, job.y + start, rows, job.d, NULL);
             }
         }
@@ -2830,7 +2883,7 @@ static void matvec_transposed_parallel(const Tensor *t, const float *x, float *y
         free(dq_row);
         return;
     }
-    if (thread_count > 8) thread_count = 8;
+    if (thread_count > MATVEC_POOL_MAX_THREADS) thread_count = MATVEC_POOL_MAX_THREADS;
     if (thread_count > d) thread_count = d;
     if (thread_count < 2) {
         float *dq_row = (float*)malloc((size_t)n * sizeof(float));
@@ -2935,8 +2988,8 @@ static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, in
         return;
     }
 
-    /* Only parallelize standard row-major non-transposed matrices */
-    if (!((int)t->dims[0] == n && (int)t->dims[1] == d)) {
+    /* Only parallelize standard GGML row access: dims[0] = d, dims[1] = n */
+    if (!((int)t->dims[0] == d && (int)t->dims[1] == n)) {
         matvec_no_parallel(t, x, y, n, d, NULL);
         return;
     }
@@ -3184,12 +3237,10 @@ static void matvec_transposed_parallel(const Tensor *t, const float *x, float *y
 static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
     int i, j;
     int use_transposed = 0;
-    /* Transposed tensor fallback: [d, n] instead of [n, d].
-       CRITICAL: when n==d (square matrices), we cannot tell orientation.
-       GGUF convention is [n, d], so assume standard layout for squares.
-       Only use fallback when dims are clearly swapped and non-square. */
+    /* GGML/GGUF 2D tensors use dims[0] = input width (d), dims[1] = output rows (n).
+       Only use the transpose fallback when the tensor is clearly stored as [n, d]. */
     if (t && t->force_transpose) use_transposed = 1;
-    else if ((int)t->dims[0] == d && (int)t->dims[1] == n && n != d) use_transposed = 1;
+    else if ((int)t->dims[0] == n && (int)t->dims[1] == d && n != d) use_transposed = 1;
     if (use_transposed) {
         float *dq_row = (float*)malloc((size_t)n * sizeof(float));
         int j, v;
@@ -3239,9 +3290,9 @@ static void matvec_no_parallel(const Tensor *t, const float *x, float *y, int n,
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row) {
     int use_transposed = 0;
     if (t && t->force_transpose) use_transposed = 1;
-    else if ((int)t->dims[0] == d && (int)t->dims[1] == n && n != d) use_transposed = 1;
+    else if ((int)t->dims[0] == n && (int)t->dims[1] == d && n != d) use_transposed = 1;
     if (should_parallelize_matvec(n, d)) {
-        if ((int)t->dims[0] == n && (int)t->dims[1] == d) {
+        if ((int)t->dims[0] == d && (int)t->dims[1] == n) {
             if (use_transposed) {
                 matvec_transposed_parallel(t, x, y, n, d);
                 return;
@@ -3258,7 +3309,7 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
         matvec_no_parallel(t, x, y, n, d, dq_row);
         return;
     }
-    if ((int)t->dims[0] == n && (int)t->dims[1] == d) {
+    if ((int)t->dims[0] == d && (int)t->dims[1] == n) {
         matvec_no_parallel(t, x, y, n, d, dq_row);
         return;
     }
@@ -3269,7 +3320,7 @@ static void matvec(const Tensor *t, const float *x, float *y, int n, int d, floa
 static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user, int n_kv_user, int hidden_user, int seq_user) {
     int i;
     Tensor *t;
-    size_t cache_budget = (sizeof(void*) <= 4) ? (192U * 1024U * 1024U) : (768U * 1024U * 1024U);
+    size_t cache_budget = (sizeof(void*) <= 4) ? (1536U * 1024U * 1024U) : (2048U * 1024U * 1024U);
     size_t cache_used = 0;
     int prefer_output_cache = 0;
     int legacy_windows = is_legacy_windows();
@@ -3288,16 +3339,16 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         return 1;
     }
     m->tok_embd = t;
-    /* Auto-detect transposed embeddings: vocab is usually much larger than dim */
-    if (t->dims[1] > t->dims[0]) {
-        m->vocab_size = (int)t->dims[1];
+    /* GGML/GGUF embeddings are normally stored as [dim, vocab]. */
+    if (t->dims[0] <= t->dims[1]) {
         m->dim = (int)t->dims[0];
-        m->tok_embd_transposed = 1;
-        printf("Note: token_embd.weight is transposed ([%u,%u])\n", (unsigned int)t->dims[0], (unsigned int)t->dims[1]);
+        m->vocab_size = (int)t->dims[1];
+        m->tok_embd_transposed = 0;
     } else {
         m->vocab_size = (int)t->dims[0];
         m->dim = (int)t->dims[1];
-        m->tok_embd_transposed = 0;
+        m->tok_embd_transposed = 1;
+        printf("Note: token_embd.weight is transposed ([%u,%u])\n", (unsigned int)t->dims[0], (unsigned int)t->dims[1]);
     }
 
     t = find_tensor(ctx, "output_norm.weight");
@@ -3443,7 +3494,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     if (!legacy_windows && m->tok_embd_transposed && m->arch != ARCH_GPT2 && !prefer_output_cache) {
         size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
-            printf("Caching transposed token embeddings in F32 for speed...\n");
+            if (!g_clean_output) printf("Caching transposed token embeddings in F32 for speed...\n");
             m->cached_embd = cache_transposed_tensor_f32(m->tok_embd, m->dim, m->vocab_size);
             if (!m->cached_embd) {
                 fprintf(stderr, "Failed to allocate embedding cache (%u MB)\n",
@@ -3454,11 +3505,13 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             if (m->output == m->tok_embd) {
                 m->cached_output = m->cached_embd;
             }
-            printf("Embedding cache ready.\n");
+            if (!g_clean_output) printf("Embedding cache ready.\n");
         } else {
-            printf("Skipping embedding cache (%u MB needed, %u MB budget left)\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)),
-                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            if (!g_clean_output) {
+                printf("Skipping embedding cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
         }
     }
 
@@ -3466,7 +3519,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         (m->arch == ARCH_QWEN2 || m->arch == ARCH_QWEN3 || m->arch == ARCH_QWEN25) && !m->cached_embd) {
         size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
-            printf("Caching Qwen token embeddings in logical F32...\n");
+            if (!g_clean_output) printf("Caching Qwen token embeddings in logical F32...\n");
             m->cached_embd = cache_tensor_logical_f32(m->tok_embd, m->vocab_size, m->dim);
             if (!m->cached_embd) {
                 fprintf(stderr, "Failed to allocate Qwen embedding cache (%u MB)\n",
@@ -3475,17 +3528,19 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             }
             m->tok_embd->data = m->cached_embd;
             m->tok_embd->type = 0;
-            m->tok_embd->dims[0] = (u64)m->vocab_size;
-            m->tok_embd->dims[1] = (u64)m->dim;
+            m->tok_embd->dims[0] = (u64)m->dim;
+            m->tok_embd->dims[1] = (u64)m->vocab_size;
             cache_used += cache_bytes;
             if (m->output == m->tok_embd) {
                 m->cached_output = m->cached_embd;
             }
-            printf("Qwen embedding cache ready.\n");
+            if (!g_clean_output) printf("Qwen embedding cache ready.\n");
         } else {
-            printf("Skipping Qwen embedding cache (%u MB needed, %u MB budget left)\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)),
-                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            if (!g_clean_output) {
+                printf("Skipping Qwen embedding cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
         }
     }
 
@@ -3494,7 +3549,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         !m->cached_output && m->output && m->output != m->tok_embd && m->output->type != 0) {
         size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
-            printf("Caching Qwen output head in logical F32...\n");
+            if (!g_clean_output) printf("Caching Qwen output head in logical F32...\n");
             m->cached_output = cache_tensor_logical_f32(m->output, m->vocab_size, m->dim);
             if (!m->cached_output) {
                 fprintf(stderr, "Failed to allocate Qwen output cache (%u MB)\n",
@@ -3503,14 +3558,16 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             }
             m->output->data = m->cached_output;
             m->output->type = 0;
-            m->output->dims[0] = (u64)m->vocab_size;
-            m->output->dims[1] = (u64)m->dim;
+            m->output->dims[0] = (u64)m->dim;
+            m->output->dims[1] = (u64)m->vocab_size;
             cache_used += cache_bytes;
-            printf("Qwen output cache ready.\n");
+            if (!g_clean_output) printf("Qwen output cache ready.\n");
         } else {
-            printf("Skipping Qwen output cache (%u MB needed, %u MB budget left)\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)),
-                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            if (!g_clean_output) {
+                printf("Skipping Qwen output cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
         }
     }
 
@@ -3521,8 +3578,10 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     {
         int safe_seq = effective_seq_limit(m->max_seq_len, m->n_layers, m->n_kv_heads, m->head_dim);
         if (safe_seq < m->max_seq_len) {
-            printf("WARNING: capping seq_len %d -> %d to keep KV cache under 256MB\n",
-                   m->max_seq_len, safe_seq);
+            if (!g_clean_output) {
+                printf("WARNING: capping seq_len %d -> %d to keep KV cache under 256MB\n",
+                       m->max_seq_len, safe_seq);
+            }
             m->max_seq_len = safe_seq;
         }
     }
@@ -3621,7 +3680,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         m->output_norm_bias = find_tensor(ctx, "output_norm.bias");
         if (!m->output_norm_bias) m->output_norm_bias = find_tensor(ctx, "ln_f.bias");
 
-        printf("Caching GPT2 embeddings in logical row-major F32...\n");
+        if (!g_clean_output) printf("Caching GPT2 embeddings in logical row-major F32...\n");
         m->cached_embd = cache_tensor_logical_f32(m->tok_embd, m->vocab_size, m->dim);
         if (!m->cached_embd) {
             fprintf(stderr, "Failed to cache GPT2 token embeddings\n");
@@ -3637,7 +3696,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             fprintf(stderr, "Failed to cache GPT2 output head\n");
             return 1;
         }
-        printf("GPT2 embedding/output cache ready.\n");
+        if (!g_clean_output) printf("GPT2 embedding/output cache ready.\n");
 
         for (l = 0; l < m->n_layers; l++) {
             char name[128];
@@ -3686,14 +3745,16 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
                 return 1;
             }
         }
-        printf("Caching hot projection weights in F32 for speed...\n");
+        if (!g_clean_output) printf("Caching hot projection weights in F32 for speed...\n");
         for (l = 0; l < m->n_layers; l++) {
             (void)l;
         }
-        printf("Hot weights cache pass complete.\n");
-        printf("Model: dim=%d layers=%d heads=%d head_dim=%d kv_heads=%d hidden=%d vocab=%d seq=%d arch=%s\n",
-               m->dim, m->n_layers, m->n_heads, m->head_dim, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len,
-               hp->architecture);
+        if (!g_clean_output) {
+            printf("Hot weights cache pass complete.\n");
+            printf("Model: dim=%d layers=%d heads=%d head_dim=%d kv_heads=%d hidden=%d vocab=%d seq=%d arch=%s\n",
+                   m->dim, m->n_layers, m->n_heads, m->head_dim, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len,
+                   hp->architecture);
+        }
         return 0;
     }
 
@@ -3735,20 +3796,6 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         if (m->ffn_norm[i] && m->ffn_norm[i]->type != 0)
             printf("Warning: layer %d ffn_norm is type %u (expected F32)\n", i, m->ffn_norm[i]->type);
 
-        if (m->attn_q[i] && (int)m->attn_q[i]->dims[0] == m->dim && (int)m->attn_q[i]->dims[1] == m->q_dim)
-            m->attn_q[i]->force_transpose = 1;
-        if (m->attn_k[i] && (int)m->attn_k[i]->dims[0] == m->dim && (int)m->attn_k[i]->dims[1] == m->kv_dim)
-            m->attn_k[i]->force_transpose = 1;
-        if (m->attn_v[i] && (int)m->attn_v[i]->dims[0] == m->dim && (int)m->attn_v[i]->dims[1] == m->kv_dim)
-            m->attn_v[i]->force_transpose = 1;
-        if (m->attn_o[i] && (int)m->attn_o[i]->dims[0] == m->q_dim && (int)m->attn_o[i]->dims[1] == m->dim)
-            m->attn_o[i]->force_transpose = 1;
-        if (m->ffn_gate[i] && (int)m->ffn_gate[i]->dims[0] == m->dim && (int)m->ffn_gate[i]->dims[1] == m->hidden_dim)
-            m->ffn_gate[i]->force_transpose = 1;
-        if (m->ffn_up[i] && (int)m->ffn_up[i]->dims[0] == m->dim && (int)m->ffn_up[i]->dims[1] == m->hidden_dim)
-            m->ffn_up[i]->force_transpose = 1;
-        if (m->ffn_down[i] && (int)m->ffn_down[i]->dims[0] == m->hidden_dim && (int)m->ffn_down[i]->dims[1] == m->dim)
-            m->ffn_down[i]->force_transpose = 1;
     }
 
     if (m->output_norm && m->output_norm->type != 0) {
@@ -3790,19 +3837,21 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         m->output->dims[1] > m->output->dims[0] && m->output->type != 0) {
         size_t cache_bytes = (size_t)m->output->dims[0] * (size_t)m->output->dims[1] * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
-            printf("Caching transposed output head in F32 for speed...\n");
+            if (!g_clean_output) printf("Caching transposed output head in F32 for speed...\n");
             m->cached_output = cache_transposed_tensor_f32(m->output, (int)m->output->dims[0], (int)m->output->dims[1]);
             if (!m->cached_output) {
                 fprintf(stderr, "Warning: failed to cache output head (%u MB)\n",
                         (unsigned int)(cache_bytes / (1024U * 1024U)));
             } else {
                 cache_used += cache_bytes;
-                printf("Output cache ready.\n");
+                if (!g_clean_output) printf("Output cache ready.\n");
             }
         } else {
-            printf("Skipping output cache (%u MB needed, %u MB budget left)\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)),
-                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            if (!g_clean_output) {
+                printf("Skipping output cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
         }
     }
 
@@ -3811,6 +3860,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         int cached_count = 0;
         int skipped_count = 0;
         int failed_count = 0;
+        size_t hot_bytes_needed = 0;
         int force_transpose_square_kv =
             (m->arch == ARCH_QWEN2 || m->arch == ARCH_QWEN3 || m->arch == ARCH_QWEN25) &&
             m->attn_q[0] &&
@@ -3818,8 +3868,29 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             (int)m->attn_q[0]->dims[1] == m->q_dim &&
             m->q_dim != m->dim;
 
-        printf("Caching hot projection weights in F32 for speed (budget %u MB)...\n",
-               (unsigned int)(cache_budget / (1024U * 1024U)));
+        for (l = 0; l < m->n_layers; l++) {
+            if (m->attn_q[l] && m->attn_q[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->attn_q[l]);
+            if (m->attn_k[l] && m->attn_k[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->attn_k[l]);
+            if (m->attn_v[l] && m->attn_v[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->attn_v[l]);
+            if (m->attn_o[l] && m->attn_o[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->attn_o[l]);
+            if (m->ffn_gate[l] && m->ffn_gate[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->ffn_gate[l]);
+            if (m->ffn_up[l] && m->ffn_up[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->ffn_up[l]);
+            if (m->ffn_down[l] && m->ffn_down[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->ffn_down[l]);
+        }
+
+        if (hot_bytes_needed > cache_budget - cache_used) {
+            if (!g_clean_output) {
+                printf("Skipping hot-weight cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(hot_bytes_needed / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
+            goto hot_cache_done;
+        }
+
+        if (!g_clean_output) {
+            printf("Caching hot projection weights in F32 for speed (budget %u MB)...\n",
+                   (unsigned int)(cache_budget / (1024U * 1024U)));
+        }
         if (force_transpose_square_kv) {
             for (l = 0; l < m->n_layers; l++) {
                 int rc;
@@ -3876,14 +3947,18 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
                 if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_down[l]->name); } else skipped_count++;
             }
         }
-        printf("Hot weights cache pass complete: cached=%d skipped=%d failed=%d used=%u/%u MB\n",
-               cached_count,
-               skipped_count,
-               failed_count,
-               (unsigned int)(cache_used / (1024U * 1024U)),
-               (unsigned int)(cache_budget / (1024U * 1024U)));
+        if (!g_clean_output) {
+            printf("Hot weights cache pass complete: cached=%d skipped=%d failed=%d used=%u/%u MB\n",
+                   cached_count,
+                   skipped_count,
+                   failed_count,
+                   (unsigned int)(cache_used / (1024U * 1024U)),
+                   (unsigned int)(cache_budget / (1024U * 1024U)));
+        }
+hot_cache_done:
+        ;
     } else {
-        printf("Skipping hot-weight cache on legacy Windows.\n");
+        if (!g_clean_output) printf("Skipping hot-weight cache for this model/runtime.\n");
     }
 
     if (!legacy_windows &&
@@ -3892,48 +3967,51 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         m->output->dims[1] > m->output->dims[0] && m->output->type != 0) {
         size_t cache_bytes = (size_t)m->output->dims[0] * (size_t)m->output->dims[1] * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
-            printf("Caching transposed output head in F32 after hot-weight cache...\n");
+            if (!g_clean_output) printf("Caching transposed output head in F32 after hot-weight cache...\n");
             m->cached_output = cache_transposed_tensor_f32(m->output, (int)m->output->dims[0], (int)m->output->dims[1]);
             if (!m->cached_output) {
                 fprintf(stderr, "Warning: failed to cache output head (%u MB)\n",
                         (unsigned int)(cache_bytes / (1024U * 1024U)));
             } else {
                 cache_used += cache_bytes;
-                printf("Output cache ready.\n");
+                if (!g_clean_output) printf("Output cache ready.\n");
             }
         } else {
-            printf("Skipping output cache after hot-weight cache (%u MB needed, %u MB budget left)\n",
-                   (unsigned int)(cache_bytes / (1024U * 1024U)),
-                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            if (!g_clean_output) {
+                printf("Skipping output cache after hot-weight cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
         }
     }
 
     /* Diagnostics: verify block sizes and tensor offsets */
-    printf("Block sizes: Q4_0=%u Q5_0=%u Q5_1=%u Q8_0=%u Q4K=%u(exp144) Q5K=%u(exp176) Q6K=%u(exp210)\n",
-           (unsigned int)sizeof(BlockQ4),
-           (unsigned int)sizeof(BlockQ5_0),
-           (unsigned int)sizeof(BlockQ5_1),
-           (unsigned int)sizeof(BlockQ8),
-           (unsigned int)sizeof(BlockQ4K),
-           (unsigned int)sizeof(BlockQ5K),
-           (unsigned int)sizeof(BlockQ6K));
-    printf("tok_embd: dims=[%u,%u] type=%u transposed=%d\n",
-           (unsigned int)m->tok_embd->dims[0],
-           (unsigned int)m->tok_embd->dims[1],
-           (unsigned int)m->tok_embd->type,
-           m->tok_embd_transposed);
-    for (i = 0; i < (int)ctx->n_tensors && i < 5; i++) {
-        printf("Tensor[%d]: %s offset=%u\n", i,
-               ctx->tensors[i].name,
-               (unsigned int)(ctx->tensors[i].offset & 0xFFFFFFFFUL));
+    if (!g_clean_output) {
+        printf("Block sizes: Q4_0=%u Q5_0=%u Q5_1=%u Q8_0=%u Q4K=%u(exp144) Q5K=%u(exp176) Q6K=%u(exp210)\n",
+               (unsigned int)sizeof(BlockQ4),
+               (unsigned int)sizeof(BlockQ5_0),
+               (unsigned int)sizeof(BlockQ5_1),
+               (unsigned int)sizeof(BlockQ8),
+               (unsigned int)sizeof(BlockQ4K),
+               (unsigned int)sizeof(BlockQ5K),
+               (unsigned int)sizeof(BlockQ6K));
+        printf("tok_embd: dims=[%u,%u] type=%u transposed=%d\n",
+               (unsigned int)m->tok_embd->dims[0],
+               (unsigned int)m->tok_embd->dims[1],
+               (unsigned int)m->tok_embd->type,
+               m->tok_embd_transposed);
+        for (i = 0; i < (int)ctx->n_tensors && i < 5; i++) {
+            printf("Tensor[%d]: %s offset=%u\n", i,
+                   ctx->tensors[i].name,
+                   (unsigned int)(ctx->tensors[i].offset & 0xFFFFFFFFUL));
+        }
+        printf("data_offset=%u file_size=%u\n",
+               (unsigned int)(ctx->data_offset & 0xFFFFFFFFUL),
+               (unsigned int)(ctx->size & 0xFFFFFFFFUL));
+        printf("Model: dim=%d layers=%d heads=%d head_dim=%d rope_dim=%d kv_heads=%d hidden=%d vocab=%d seq=%d arch=%s\n",
+               m->dim, m->n_layers, m->n_heads, m->head_dim, m->rope_dim, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len,
+               hp->architecture);
     }
-    printf("data_offset=%u file_size=%u\n",
-           (unsigned int)(ctx->data_offset & 0xFFFFFFFFUL),
-           (unsigned int)(ctx->size & 0xFFFFFFFFUL));
-
-    printf("Model: dim=%d layers=%d heads=%d head_dim=%d rope_dim=%d kv_heads=%d hidden=%d vocab=%d seq=%d arch=%s\n",
-           m->dim, m->n_layers, m->n_heads, m->head_dim, m->rope_dim, m->n_kv_heads, m->hidden_dim, m->vocab_size, m->max_seq_len,
-           hp->architecture);
     if (legacy_windows) {
         printf("Legacy Windows mode: conservative matvec/cache path enabled\n");
     }
@@ -3969,15 +4047,17 @@ static int alloc_runstate(Model *m, RunState *s, GGUFContext *ctx) {
     if (hidden_dim > max_d) max_d = hidden_dim;
     if (vocab_size > max_d) max_d = vocab_size;
 
-    printf("Allocating run state...\n");
-    printf("  x: %u bytes\n", (unsigned int)(dim * sizeof(float)));
-    printf("  q/attn_out: %u bytes each\n", (unsigned int)(q_dim * sizeof(float)));
-    printf("  k/v total: %u bytes each\n", (unsigned int)(kv_dim * sizeof(float)));
-    printf("  ffn_gate/up/hidden: %u bytes each\n", (unsigned int)(hidden_dim * sizeof(float)));
-    printf("  logits: %u bytes\n", (unsigned int)(vocab_size * sizeof(float)));
-    printf("  k_cache+v_cache: %u bytes\n", (unsigned int)(kv_size * sizeof(float) * 2));
-    printf("  dq_row: %u bytes\n", (unsigned int)(max_d * sizeof(float)));
-    printf("  Total state: ~%u KB\n", (unsigned int)((dim + q_dim*2 + kv_dim*2 + hidden_dim*3 + vocab_size + kv_size*2 + max_seq_len + max_d) * sizeof(float) / 1024));
+    if (!g_clean_output) {
+        printf("Allocating run state...\n");
+        printf("  x: %u bytes\n", (unsigned int)(dim * sizeof(float)));
+        printf("  q/attn_out: %u bytes each\n", (unsigned int)(q_dim * sizeof(float)));
+        printf("  k/v total: %u bytes each\n", (unsigned int)(kv_dim * sizeof(float)));
+        printf("  ffn_gate/up/hidden: %u bytes each\n", (unsigned int)(hidden_dim * sizeof(float)));
+        printf("  logits: %u bytes\n", (unsigned int)(vocab_size * sizeof(float)));
+        printf("  k_cache+v_cache: %u bytes\n", (unsigned int)(kv_size * sizeof(float) * 2));
+        printf("  dq_row: %u bytes\n", (unsigned int)(max_d * sizeof(float)));
+        printf("  Total state: ~%u KB\n", (unsigned int)((dim + q_dim*2 + kv_dim*2 + hidden_dim*3 + vocab_size + kv_size*2 + max_seq_len + max_d) * sizeof(float) / 1024));
+    }
 
     s->x = (float*)malloc(dim * sizeof(float));
     s->q = (float*)malloc(q_dim * sizeof(float));
@@ -4072,7 +4152,7 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 
         if (m->cached_embd) {
             memcpy(x, m->cached_embd + (size_t)token * (size_t)dim, (size_t)dim * sizeof(float));
-        } else if (m->tok_embd && (int)m->tok_embd->dims[1] == vocab_size && (int)m->tok_embd->dims[0] == dim) {
+        } else if (m->tok_embd && (int)m->tok_embd->dims[0] == dim && (int)m->tok_embd->dims[1] == vocab_size) {
             dequantize_row(m->tok_embd, x, token, dim);
         } else if (m->tok_embd_transposed) {
             load_transposed_embedding_fast(m->tok_embd, x, token, dim, vocab_size);
@@ -4081,18 +4161,18 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
         if (m->cached_pos_embd) {
             for (i2 = 0; i2 < dim; i2++) x[i2] += m->cached_pos_embd[(size_t)pos * (size_t)dim + (size_t)i2];
-        } else if (m->pos_embd && (int)m->pos_embd->dims[1] == dim) {
+        } else if (m->pos_embd && (int)m->pos_embd->dims[0] == dim) {
             dequantize_row(m->pos_embd, s->dq_row, pos, dim);
             for (i2 = 0; i2 < dim; i2++) x[i2] += s->dq_row[i2];
-        } else if (m->pos_embd && m->pos_embd->type == 0 && m->pos_embd->dims[0] == (u64)dim && m->pos_embd->dims[1] > (u64)pos) {
-            int seq = (int)m->pos_embd->dims[1];
+        } else if (m->pos_embd && m->pos_embd->type == 0 && m->pos_embd->dims[1] == (u64)dim && m->pos_embd->dims[0] > (u64)pos) {
+            int seq = (int)m->pos_embd->dims[0];
             for (i2 = 0; i2 < dim; i2++) {
                 dequantize_row(m->pos_embd, s->dq_row, i2, seq);
                 x[i2] += s->dq_row[pos];
             }
         } else if (m->pos_embd) {
-            if ((int)m->pos_embd->dims[0] == dim) {
-                int seq = (int)m->pos_embd->dims[1];
+            if ((int)m->pos_embd->dims[1] == dim) {
+                int seq = (int)m->pos_embd->dims[0];
                 for (i2 = 0; i2 < dim; i2++) {
                     dequantize_row(m->pos_embd, s->dq_row, i2, seq);
                     x[i2] += s->dq_row[pos];
@@ -4190,16 +4270,16 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
             Tensor fake;
             fake = *m->output;
             fake.type = 0;
-            fake.dims[0] = (u64)vocab_size;
-            fake.dims[1] = (u64)dim;
+            fake.dims[0] = (u64)dim;
+            fake.dims[1] = (u64)vocab_size;
             fake.data = m->cached_output;
             matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
         } else if (m->cached_embd && m->output == m->tok_embd) {
             Tensor fake;
             fake = *m->output;
             fake.type = 0;
-            fake.dims[0] = (u64)vocab_size;
-            fake.dims[1] = (u64)dim;
+            fake.dims[0] = (u64)dim;
+            fake.dims[1] = (u64)vocab_size;
             fake.data = m->cached_embd;
             matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
         } else {
@@ -4221,23 +4301,23 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
     /* Token embedding row lookup */
     if (m->cached_embd) {
         memcpy(x, m->cached_embd + (size_t)token * (size_t)dim, (size_t)dim * sizeof(float));
-    } else if (m->tok_embd_transposed) {
-        load_transposed_embedding_fast(m->tok_embd, x, token, dim, vocab_size);
-    } else {
+    } else if (!m->tok_embd_transposed) {
         dequantize_row(m->tok_embd, x, token, dim);
+    } else {
+        load_transposed_embedding_fast(m->tok_embd, x, token, dim, vocab_size);
     }
     if (m->arch == ARCH_GEMMA3 && !g_clean_output && vector_has_nan(x, dim)) {
         printf("Gemma3 debug: NaN in token embedding for token %d\n", token);
     }
 
     for (l = 0; l < n_layers; l++) {
-        int is_global_layer = is_gemma3 && (((l + 1) % 6) == 0);
+        int is_global_layer = is_gemma3 && ((l % 6) == 0);
         int attn_start = 0;
         const float *rope_cos = m->rope_cos;
         const float *rope_sin = m->rope_sin;
         /* Attention */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
-        rmsnorm(x, (float*)m->attn_norm[l]->data, dim, m->norm_eps);
+        rmsnorm_ex(x, (float*)m->attn_norm[l]->data, dim, m->norm_eps, is_gemma_family);
 
         matvec(m->attn_q[l], x, q, q_dim, dim, s->dq_row);
         matvec(m->attn_k[l], x, k, kv_dim, dim, s->dq_row);
@@ -4249,10 +4329,10 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
 
         if (m->attn_q_norm[l] && m->attn_q_norm[l]->data) {
-            for (h = 0; h < n_heads; h++) rmsnorm(q + h * head_dim, (float*)m->attn_q_norm[l]->data, head_dim, m->norm_eps);
+            for (h = 0; h < n_heads; h++) rmsnorm_ex(q + h * head_dim, (float*)m->attn_q_norm[l]->data, head_dim, m->norm_eps, is_gemma_family);
         }
         if (m->attn_k_norm[l] && m->attn_k_norm[l]->data) {
-            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rmsnorm(k + h_kv * head_dim, (float*)m->attn_k_norm[l]->data, head_dim, m->norm_eps);
+            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rmsnorm_ex(k + h_kv * head_dim, (float*)m->attn_k_norm[l]->data, head_dim, m->norm_eps, is_gemma_family);
         }
 
         if (is_gemma3) {
@@ -4269,16 +4349,12 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
             }
         }
 
-        /* Llama-family GGUFs (Llama/Qwen/SmolLM2/TinyLlama) use the half-split
-           rotate_half layout, not adjacent even/odd pairs. The old path used
-           rope_1d() here, which corrupts every RoPE-based llama variant while
-           leaving GPT-2 unaffected. */
         if (is_gemma_family) {
             for (h = 0; h < n_heads; h++) rope_1d_half(q + h * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
             for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rope_1d_half(k + h_kv * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
         } else {
-            for (h = 0; h < n_heads; h++) rope_1d_half(q + h * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
-            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rope_1d_half(k + h_kv * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
+            for (h = 0; h < n_heads; h++) rope_1d(q + h * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
+            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rope_1d(k + h_kv * head_dim, m->rope_dim, pos, rope_cos, rope_sin);
         }
 
         for (h_kv = 0; h_kv < n_kv_heads; h_kv++) {
@@ -4337,13 +4413,13 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
         matvec(m->attn_o[l], attn_out, x, dim, q_dim, s->dq_row);
         if (is_gemma_family && m->post_attn_norm[l] && m->post_attn_norm[l]->data) {
-            rmsnorm(x, (float*)m->post_attn_norm[l]->data, dim, m->norm_eps);
+            rmsnorm_ex(x, (float*)m->post_attn_norm[l]->data, dim, m->norm_eps, 1);
         }
         for (i = 0; i < dim; i++) x[i] += tmp[i];
 
         /* FFN */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
-        rmsnorm(x, (float*)m->ffn_norm[l]->data, dim, m->norm_eps);
+        rmsnorm_ex(x, (float*)m->ffn_norm[l]->data, dim, m->norm_eps, is_gemma_family);
 
         matvec(m->ffn_gate[l], x, s->ffn_gate, hidden_dim, dim, s->dq_row);
         matvec(m->ffn_up[l], x, s->ffn_up, hidden_dim, dim, s->dq_row);
@@ -4355,28 +4431,28 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 
         matvec(m->ffn_down[l], s->ffn_hidden, x, dim, hidden_dim, s->dq_row);
         if (is_gemma_family && m->post_ffn_norm[l] && m->post_ffn_norm[l]->data) {
-            rmsnorm(x, (float*)m->post_ffn_norm[l]->data, dim, m->norm_eps);
+            rmsnorm_ex(x, (float*)m->post_ffn_norm[l]->data, dim, m->norm_eps, 1);
         }
         for (i = 0; i < dim; i++) x[i] += tmp[i];
     }
 
     if (!compute_logits) return 0;
 
-    rmsnorm(x, (float*)m->output_norm->data, dim, m->norm_eps);
+    rmsnorm_ex(x, (float*)m->output_norm->data, dim, m->norm_eps, is_gemma_family);
     if (m->cached_output) {
         Tensor fake;
         fake = *m->output;
         fake.type = 0;
-        fake.dims[0] = (u64)vocab_size;
-        fake.dims[1] = (u64)dim;
+        fake.dims[0] = (u64)dim;
+        fake.dims[1] = (u64)vocab_size;
         fake.data = m->cached_output;
         matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
     } else if (m->cached_embd && m->output == m->tok_embd) {
         Tensor fake;
         fake = *m->output;
         fake.type = 0;
-        fake.dims[0] = (u64)vocab_size;
-        fake.dims[1] = (u64)dim;
+        fake.dims[0] = (u64)dim;
+        fake.dims[1] = (u64)vocab_size;
         fake.data = m->cached_embd;
         matvec(&fake, x, s->logits, vocab_size, dim, s->dq_row);
     } else if (m->tok_embd_transposed && m->output == m->tok_embd) {
@@ -4418,7 +4494,14 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
         printf("Gemma3 logits top5:");
         for (bi = 0; bi < 5; bi++) {
-            if (best[bi] >= 0) printf(" %d=%.4f", best[bi], bestv[bi]);
+            if (best[bi] >= 0) {
+                printf(" %d=%.4f", best[bi], bestv[bi]);
+                if (g_vocab && best[bi] < g_vocab_n && g_vocab[best[bi]].len > 0 && g_vocab[best[bi]].len < 32) {
+                    printf(" '");
+                    print_token_text_clean(g_vocab[best[bi]].text, g_vocab[best[bi]].len);
+                    printf("'");
+                }
+            }
         }
         printf("\n");
     }
@@ -4456,6 +4539,7 @@ static int load_tokenizer(const char *path) {
     g_sorted_init = 0;
     free_gpt2_tokenizer_tables();
     reset_byte_token_map();
+    g_gpt2_add_space_prefix = 0;
     f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END); sz = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
@@ -4485,7 +4569,7 @@ static int load_tokenizer(const char *path) {
     g_vocab_n = parsed;
     g_tok_buf = buf;
     rebuild_byte_token_map();
-    printf("Loaded tokenizer: %d tokens\n", g_vocab_n);
+    if (!g_clean_output) printf("Loaded tokenizer: %d tokens\n", g_vocab_n);
     return 1;
 }
 
@@ -4517,26 +4601,26 @@ static int load_tokenizer_auto(const char *model_path, const char *tok_path, GGU
 
     if (tok_path && tok_path[0] && strcmp(tok_path, "auto") != 0) {
         if (load_tokenizer(tok_path)) {
-            printf("Tokenizer source: %s\n", tok_path);
+            if (!g_clean_output) printf("Tokenizer source: %s\n", tok_path);
             return 1;
         }
-        printf("Warning: failed to load tokenizer file %s\n", tok_path);
+        if (!g_clean_output) printf("Warning: failed to load tokenizer file %s\n", tok_path);
     }
 
     if (load_tokenizer_from_gguf(ctx)) {
-        printf("Tokenizer source: embedded GGUF metadata\n");
+        if (!g_clean_output) printf("Tokenizer source: embedded GGUF metadata\n");
         return 1;
     }
 
     if (discover_tokenizer_path(model_path, found, sizeof(found))) {
         if (load_tokenizer(found)) {
-            printf("Tokenizer source: %s\n", found);
+            if (!g_clean_output) printf("Tokenizer source: %s\n", found);
             return 1;
         }
-        printf("Warning: failed to load discovered tokenizer file %s\n", found);
+        if (!g_clean_output) printf("Warning: failed to load discovered tokenizer file %s\n", found);
     }
 
-    printf("Warning: no tokenizer file found; falling back to raw byte tokens\n");
+    if (!g_clean_output) printf("Warning: no tokenizer file found; falling back to raw byte tokens\n");
     return 0;
 }
 
@@ -4570,7 +4654,7 @@ static void init_sorted_vocab(void) {
         g_sorted_vocab[cursors[len]++] = i;
     }
     g_sorted_init = 1;
-    printf("Tokenizer sorted: %d tokens by length\n", g_vocab_n);
+        if (!g_clean_output) printf("Tokenizer sorted: %d tokens by length\n", g_vocab_n);
 }
 
 static int tokenize(const char *text, int *tokens, int max_tokens, int vocab_size) {
@@ -4738,6 +4822,7 @@ static void scan_special_tokens(void) {
         "<bos>", "<|user|>", "<|assistant|>", "<start_of_turn>"
     };
     int i;
+    if (g_clean_output) return;
     printf("Special tokens: ");
     for (i = 0; i < 9; i++) {
         ids[i] = find_special_token(names[i]);
@@ -4746,6 +4831,71 @@ static void scan_special_tokens(void) {
     if (find_special_token("<end_of_turn>") >= 0) printf("<end_of_turn>=%d ", find_special_token("<end_of_turn>"));
     if (find_special_token("\n") >= 0) printf("\\n=%d ", find_special_token("\n"));
     printf("\n");
+}
+
+static void init_eog_tokens(void) {
+    const char *names[4] = { "<|endoftext|>", "<|im_end|>", "<reponame>", "</s>" };
+    int i;
+    g_eog_token_count = 0;
+    for (i = 0; i < 4; i++) {
+        int tok = find_special_token(names[i]);
+        int j;
+        if (tok < 0) continue;
+        for (j = 0; j < g_eog_token_count; j++) {
+            if (g_eog_tokens[j] == tok) break;
+        }
+        if (j == g_eog_token_count && g_eog_token_count < 8) {
+            g_eog_tokens[g_eog_token_count++] = tok;
+        }
+    }
+}
+
+static int is_eog_token(int tok, int eos_token) {
+    int i;
+    if (tok < 0) return 0;
+    if (eos_token >= 0 && tok == eos_token) return 1;
+    for (i = 0; i < g_eog_token_count; i++) {
+        if (g_eog_tokens[i] == tok) return 1;
+    }
+    return 0;
+}
+
+static void print_banner(void) {
+    printf("                                _____\n");
+    printf(" ___ _ __   ___ _ __ _ __ ___  / ____|\n");
+    printf("/ __| '_ \\ / _ \\ '__| '_ ` _ \\| |\n");
+    printf("\\__ \\ |_) |  __/ |  | | | | | | |____\n");
+    printf("|___/ .__/ \\___|_|  |_| |_| |_|\\_____|\n");
+    printf("    |_|\n");
+    printf("\n");
+}
+
+static void sanitize_repl_input(char *s) {
+    unsigned char *p = (unsigned char*)s;
+    size_t i, j, len;
+    if (!s || !s[0]) return;
+    if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) {
+        memmove(s, s + 3, strlen(s + 3) + 1);
+        p = (unsigned char*)s;
+    }
+    len = strlen(s);
+    i = 0;
+    while (i < len) {
+        unsigned char c = p[i];
+        if (c >= 32 || c == '\t') break;
+        i++;
+    }
+    if (i > 0) {
+        memmove(s, s + i, len - i + 1);
+        len -= i;
+    }
+    for (i = 0, j = 0; i < len; i++) {
+        unsigned char c = p[i];
+        if (c == 0) break;
+        if (c < 32 && c != '\t') continue;
+        p[j++] = c;
+    }
+    p[j] = '\0';
 }
 
 static void path_stem(const char *path, char *out, size_t out_cap) {
@@ -5207,12 +5357,288 @@ body_fail:
     return 1;
 }
 
+static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
+                             const char *model_path, const char *prompt,
+                             int n_generate, float temp, int top_k, float top_p, float min_p,
+                             int eos_token, int no_eos_stop, int do_chat, int do_raw_tokens,
+                             int gpt2_instruct_mode, int smollm2_mode, int qwen_chatml_mode,
+                             int tinyllama_mode, int gemma3_mode, int slopllm_mode,
+                             int interactive_mode, int n_generate_user) {
+    RunState s;
+    int prompt_len = 0;
+    int *prompt_tokens;
+    int next_token = 0;
+    int stop_on_eos = 0;
+    int max_generate;
+    int pos;
+    int i;
+    int tokens_printed = 0;
+    double t_request_start;
+    double t_first_token = 0.0;
+    double t_end;
+
+    if (!prompt) prompt = "";
+    max_generate = n_generate;
+    if (interactive_mode && !n_generate_user) max_generate = 256;
+    if (max_generate < 1) max_generate = 1;
+    stop_on_eos = interactive_mode && !no_eos_stop;
+    g_allow_eog_sampling = stop_on_eos ? 1 : 0;
+    memset(&s, 0, sizeof(s));
+    if (alloc_runstate(m, &s, ctx) != 0) {
+        g_allow_eog_sampling = 0;
+        return 1;
+    }
+
+    prompt_tokens = (int*)malloc(m->max_seq_len * sizeof(int));
+    if (!prompt_tokens) {
+        fprintf(stderr, "Failed to allocate prompt buffer\n");
+        free_runstate(&s);
+        g_allow_eog_sampling = 0;
+        return 1;
+    }
+
+    /* Build prompt tokens */
+    {
+        int tok_im_start = find_special_token("<|im_start|>");
+        int tok_im_end = find_special_token("<|im_end|>");
+        int tok_bos = find_special_token("<bos>");
+        int tok_endoftext = find_special_token("<|endoftext|>");
+        int tok_user = find_special_token("<|user|>");
+        int tok_assistant = find_special_token("<|assistant|>");
+        int auto_bos_id = hp->tokenizer_bos_token_id > 0 ? (int)hp->tokenizer_bos_token_id : -1;
+        if (tok_bos < 0) tok_bos = find_special_token("<s>");
+        if (auto_bos_id < 0) auto_bos_id = tok_bos;
+        if (auto_bos_id < 0) auto_bos_id = tok_endoftext;
+        int prompt_has_template =
+            contains_nocase(prompt, "<start_of_turn>") ||
+            contains_nocase(prompt, "<|im_start|>") ||
+            contains_nocase(prompt, "<|user|>") ||
+            contains_nocase(prompt, "<|assistant|>") ||
+            contains_nocase(prompt, "[INST]") ||
+            contains_nocase(prompt, "user:");
+        int n = 0;
+        int wrapped_prompt = 0;
+
+        if (gpt2_instruct_mode && !do_chat && !prompt_has_template) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: gpt2-instruct user/assistant style\n");
+            if (tok_user >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_user;
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+            if (tok_assistant >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_assistant;
+        } else if (!do_chat && prompt_has_template) {
+            if (!g_clean_output) printf("Prompt already looks templated; using raw prompt text\n");
+            prompt_len = tokenize(prompt, prompt_tokens, m->max_seq_len, m->vocab_size);
+        } else if (qwen_chatml_mode) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: qwen ChatML special-token style\n");
+            if (tok_im_start >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_start;
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "user\n", m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "\n", m->vocab_size);
+            if (tok_im_end >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_end;
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "\n", m->vocab_size);
+            if (tok_im_start >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_start;
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "assistant\n", m->vocab_size);
+        } else if (m->arch == ARCH_GPT2 || (!do_chat && !smollm2_mode && !qwen_chatml_mode && !tinyllama_mode && !gemma3_mode && !slopllm_mode)) {
+            prompt_len = tokenize(prompt, prompt_tokens, m->max_seq_len, m->vocab_size);
+        } else if (smollm2_mode) {
+            char *chat_buf;
+            size_t chat_cap;
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: smollm2 ChatML style\n");
+            chat_cap = strlen(prompt) + 256;
+            chat_buf = (char*)malloc(chat_cap);
+            if (!chat_buf) {
+                fprintf(stderr, "Failed to allocate SmolLM2 prompt buffer\n");
+                free(prompt_tokens);
+                free_runstate(&s);
+                g_allow_eog_sampling = 0;
+                return 1;
+            }
+            sprintf(chat_buf,
+                    "<|im_start|>system\n"
+                    "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+                    "<|im_end|>\n"
+                    "<|im_start|>user\n"
+                    "%s"
+                    "<|im_end|>\n"
+                    "<|im_start|>assistant\n",
+                    prompt);
+            prompt_len = tokenize(chat_buf, prompt_tokens, m->max_seq_len, m->vocab_size);
+            free(chat_buf);
+            n = prompt_len;
+        } else if (gemma3_mode) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: gemma3 start_of_turn style (no system, with BOS)\n");
+            if (tok_bos >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_bos;
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<start_of_turn>user\n", m->vocab_size);
+            n = append_sentencepiece_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<end_of_turn>\n", m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<start_of_turn>model\n", m->vocab_size);
+        } else if (tinyllama_mode) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<s>[INST] ", m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, " [/INST]", m->vocab_size);
+        } else if (slopllm_mode) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: slopllm user/assistant style\n");
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "user: ", m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+            n = append_text_tokens(prompt_tokens, m->max_seq_len, n, " assistant:", m->vocab_size);
+        } else {
+            wrapped_prompt = 1;
+            {
+                int tmp_tok[256];
+                int tmp_n;
+                if (tok_im_start < 0) tok_im_start = find_special_token("<s>");
+                if (tok_im_end < 0) tok_im_end = find_special_token("</s>");
+                if (!g_clean_output) printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
+                if (tok_im_start >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_start;
+                tmp_n = tokenize("user\n", tmp_tok, 256, m->vocab_size);
+                for (i = 0; i < tmp_n && n < m->max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+                tmp_n = tokenize(prompt, tmp_tok, 256, m->vocab_size);
+                for (i = 0; i < tmp_n && n < m->max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+                tmp_n = tokenize("\n", tmp_tok, 256, m->vocab_size);
+                for (i = 0; i < tmp_n && n < m->max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+                if (tok_im_end >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_end;
+                tmp_n = tokenize("\n", tmp_tok, 256, m->vocab_size);
+                for (i = 0; i < tmp_n && n < m->max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+                if (tok_im_start >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_start;
+                tmp_n = tokenize("assistant\n", tmp_tok, 256, m->vocab_size);
+                for (i = 0; i < tmp_n && n < m->max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
+            }
+        }
+
+        if (wrapped_prompt) prompt_len = n;
+        if (hp->tokenizer_add_bos_token && auto_bos_id >= 0 && prompt_len > 0 && prompt_len < m->max_seq_len) {
+            if (prompt_tokens[0] != auto_bos_id) {
+                memmove(prompt_tokens + 1, prompt_tokens, (size_t)prompt_len * sizeof(int));
+                prompt_tokens[0] = auto_bos_id;
+                prompt_len++;
+            }
+        }
+    }
+
+    if (prompt_len < 0) {
+        fprintf(stderr, "Failed to tokenize prompt\n");
+        free(prompt_tokens);
+        free_runstate(&s);
+        g_allow_eog_sampling = 0;
+        return 1;
+    }
+
+    if (!g_clean_output) {
+        printf("Prompt tokens (%d): ", prompt_len);
+        for (i = 0; i < prompt_len && i < 30; i++) {
+            printf("[%d]", prompt_tokens[i]);
+            if (g_vocab && prompt_tokens[i] >= 0 && prompt_tokens[i] < g_vocab_n) {
+                int tlen = g_vocab[prompt_tokens[i]].len;
+                if (tlen > 0 && tlen < 20) {
+                    printf("'");
+                    print_token_text_clean(g_vocab[prompt_tokens[i]].text, tlen);
+                    printf("' ");
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    t_request_start = now_seconds();
+    if (prompt_len > 1 && !g_clean_output) {
+        printf("Prefill %d tokens...", prompt_len);
+        fflush(stdout);
+    }
+    for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
+        forward(m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
+        if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
+            printf(".");
+            fflush(stdout);
+        }
+    }
+
+    if (prompt_len > 1 && !g_clean_output) printf("\n");
+    if (prompt_len > 0) {
+        int ban_token = (!interactive_mode && !no_eos_stop && max_generate > 1) ? eos_token : -1;
+        next_token = forward(m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
+        pos = prompt_len;
+    } else {
+        int ban_token = (!interactive_mode && !no_eos_stop && max_generate > 1) ? eos_token : -1;
+        next_token = forward(m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
+        pos = 1;
+    }
+
+    {
+        int *last_tokens = (int*)malloc(m->max_seq_len * sizeof(int));
+        int n_last = 0;
+        if (!last_tokens) {
+            fprintf(stderr, "Failed to allocate repetition buffer\n");
+            free(prompt_tokens);
+            free_runstate(&s);
+            g_allow_eog_sampling = 0;
+            return 1;
+        }
+        if (!(stop_on_eos && is_eog_token(next_token, eos_token))) {
+            if (tokens_printed == 0) t_first_token = now_seconds();
+            if (do_raw_tokens) {
+                printf("[%d]", next_token);
+            } else if (next_token != 0) {
+                detokenize(next_token, m->vocab_size);
+            } else {
+                printf("<|endoftext|>");
+            }
+            fflush(stdout);
+            if (n_last < m->max_seq_len) last_tokens[n_last++] = next_token;
+            tokens_printed++;
+        }
+        for (i = 1; i < max_generate; i++) {
+            int ban_token = (!interactive_mode && !no_eos_stop && i + 1 < max_generate) ? eos_token : -1;
+            if (pos >= m->max_seq_len) break;
+            next_token = forward(m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, ban_token, 1);
+            pos++;
+            if (stop_on_eos && is_eog_token(next_token, eos_token)) break;
+            if (do_raw_tokens) {
+                printf("[%d]", next_token);
+            } else if (next_token != 0) {
+                detokenize(next_token, m->vocab_size);
+            } else {
+                printf("<|endoftext|>");
+            }
+            if (tokens_printed == 0) t_first_token = now_seconds();
+            if (n_last < m->max_seq_len) last_tokens[n_last++] = next_token;
+            tokens_printed++;
+            fflush(stdout);
+        }
+        free(last_tokens);
+    }
+    printf("\n");
+    t_end = now_seconds();
+    if (!g_clean_output) {
+        if (tokens_printed > 0) {
+            double ttft_s = t_first_token - t_request_start;
+            double gen_s = t_end - t_first_token;
+            double tps = 0.0;
+            int gen_tokens = tokens_printed > 1 ? (tokens_printed - 1) : 0;
+            if (gen_tokens > 0 && gen_s > 0.0) tps = (double)gen_tokens / gen_s;
+            printf("Stats: TTFT=%.3fs, TPS=%.2f tok/s, output=%d tokens, prompt=%d tokens, total=%.3fs\n",
+                   ttft_s, tps, tokens_printed, prompt_len, t_end - t_request_start);
+        } else {
+            printf("Stats: no tokens produced, total=%.3fs\n", t_end - t_request_start);
+        }
+    }
+
+    free(prompt_tokens);
+    free_runstate(&s);
+    g_allow_eog_sampling = 0;
+    return 0;
+}
+
 /* --- Main --- */
 
 int main(int argc, char **argv) {
     GGUFContext *ctx;
     Model m;
-    RunState s;
     HParams hp;
     char *model_path = NULL;
     char *tok_path = NULL;
@@ -5225,7 +5651,7 @@ int main(int argc, char **argv) {
     int n_generate = 64;
     float temp = 0.8f;
     float top_p = 0.95f;
-    float min_p = 0.0f;
+    float min_p = 0.05f;
     int top_k = 40;
     int eos_token = 2;
     int no_eos_stop = 0;
@@ -5234,6 +5660,8 @@ int main(int argc, char **argv) {
     int do_info = 0;
     int do_list = 0;
     int do_raw_tokens = 0;
+    int do_repl = 0;
+    int do_interactive = 0;
     int tinyllama_mode = 0;
     int gemma3_mode = 0;
     int gpt2_instruct_mode = 0;
@@ -5248,18 +5676,10 @@ int main(int argc, char **argv) {
     int top_k_user = 0;
     int top_p_user = 0;
     int min_p_user = 0;
+    int n_generate_user = 0;
     int eos_user = 0;
     unsigned int seed = 0;
     int arg;
-    int pos;
-    int prompt_len;
-    int *prompt_tokens;
-    int next_token = 0;
-    int i;
-    double t_request_start;
-    double t_first_token = 0.0;
-    double t_end;
-    int tokens_printed = 0;
     if (argc < 2) {
         printf("Usage: spermC.exe <model.gguf> [options]\n");
         printf("Options:\n");
@@ -5269,6 +5689,9 @@ int main(int argc, char **argv) {
         printf("  --no-eos-stop   Do not stop on EOS token\n");
         printf("  --raw-tokens    Print token IDs instead of text\n");
         printf("  --chat          Wrap prompt in chat template\n");
+        printf("  --repl          Keep model loaded and read prompts from stdin\n");
+        printf("  --keep-loaded   Alias for --repl\n");
+        printf("  --interactive   Llama.cpp-style interactive chat; stops on EOS\n");
         printf("  --api           Use an OpenAI-compatible API instead of local GGUF inference\n");
         printf("  --api-url <u>   API endpoint URL (default OPENAI_BASE_URL or OpenAI chat completions)\n");
         printf("  --api-model <m> API model name (default OPENAI_MODEL or model file stem)\n");
@@ -5286,9 +5709,9 @@ int main(int argc, char **argv) {
         printf("  --seq <n>       Override max sequence length\n");
         printf("  --top-k <n>     Top-k sampling, 0=disabled (default 40)\n");
         printf("  --top-p <p>     Top-p sampling (default 0.95)\n");
-        printf("  --min-p <p>     Min-p sampling (default 0.0)\n");
+        printf("  --min-p <p>     Min-p sampling (default 0.05)\n");
         printf("  --eos <id>      EOS token ID (default 2)\n");
-        printf("  --repeat-penalty <p>  Repetition penalty (default 1.15)\n");
+        printf("  --repeat-penalty <p>  Repetition penalty (default 1.0)\n");
         printf("  --threads <n|auto>   Parallel threads for large matmul (WinNT only, default auto)\n");
         return 1;
     }
@@ -5297,7 +5720,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     memset(&m, 0, sizeof(Model));
-    m.repeat_penalty = 1.15f;
+    m.repeat_penalty = 1.0f;
     reset_byte_token_map();
 
     model_path = argv[1];
@@ -5308,6 +5731,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--no-eos-stop") == 0) { no_eos_stop = 1; }
         else if (strcmp(argv[arg], "--raw-tokens") == 0) { do_raw_tokens = 1; }
         else if (strcmp(argv[arg], "--chat") == 0) { do_chat = 1; }
+        else if (strcmp(argv[arg], "--repl") == 0 || strcmp(argv[arg], "--keep-loaded") == 0) { do_repl = 1; }
+        else if (strcmp(argv[arg], "--interactive") == 0) { do_repl = 1; do_interactive = 1; }
         else if (strcmp(argv[arg], "--api") == 0) { use_api = 1; }
         else if (strcmp(argv[arg], "--api-url") == 0 && arg + 1 < argc) { api_url = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--api-model") == 0 && arg + 1 < argc) { api_model = argv[arg+1]; arg++; }
@@ -5320,7 +5745,7 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[arg], "--list") == 0) { do_list = 1; }
         else if (strcmp(argv[arg], "-f") == 0 && arg + 1 < argc) { prompt_file = argv[arg+1]; arg++; }
-        else if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); arg++; }
+        else if (strcmp(argv[arg], "-n") == 0 && arg + 1 < argc) { n_generate = atoi(argv[arg+1]); n_generate_user = 1; arg++; }
         else if (strcmp(argv[arg], "-t") == 0 && arg + 1 < argc) { temp = (float)atof(argv[arg+1]); temp_user = 1; arg++; }
         else if (strcmp(argv[arg], "-s") == 0 && arg + 1 < argc) { seed = (unsigned int)atoi(argv[arg+1]); arg++; }
         else if (strcmp(argv[arg], "--prompt") == 0 && arg + 1 < argc) { prompt = argv[arg+1]; arg++; }
@@ -5334,6 +5759,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--min-p") == 0 && arg + 1 < argc) { min_p = (float)atof(argv[arg+1]); min_p_user = 1; arg++; }
         else if (strcmp(argv[arg], "--eos") == 0 && arg + 1 < argc) { eos_token = atoi(argv[arg+1]); eos_user = 1; arg++; }
         else if (strcmp(argv[arg], "--repeat-penalty") == 0 && arg + 1 < argc) { m.repeat_penalty = (float)atof(argv[arg+1]); arg++; }
+    }
+
+    if (do_interactive) {
+        g_clean_output = 1;
+        g_interactive_ui = 1;
     }
 
     if (g_n_threads <= 0) g_n_threads = default_thread_count();
@@ -5441,9 +5871,11 @@ int main(int argc, char **argv) {
         unsigned int file_mb = (unsigned int)(ctx->size / (1024*1024));
         unsigned int cache_kb = (unsigned int)((u64)est_layers * (2 * est_dim * est_dim + est_dim * est_hidden) * 4 / 1024);
         unsigned int state_kb = (unsigned int)((u64)est_seq * est_dim * 2 * 4 / 1024);
-        printf("Estimated memory: file=%uMB + matmul_workspace=%uKB + run_state=%uKB\n",
-               file_mb, cache_kb, state_kb);
-        printf("Total RAM needed: ~%u MB\n", file_mb + cache_kb/1024 + state_kb/1024);
+        if (!g_clean_output) {
+            printf("Estimated memory: file=%uMB + matmul_workspace=%uKB + run_state=%uKB\n",
+                   file_mb, cache_kb, state_kb);
+            printf("Total RAM needed: ~%u MB\n", file_mb + cache_kb/1024 + state_kb/1024);
+        }
     }
 
     if (build_model(ctx, &m, &hp, n_heads_user, n_kv_user, hidden_user, seq_user) != 0) {
@@ -5451,26 +5883,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (alloc_runstate(&m, &s, ctx) != 0) {
-        free_model(&m);
-        gguf_free(ctx);
-        return 1;
-    }
-
-    /* Load prompt from file if requested */
-    if (prompt_file) {
-        FILE *fp = fopen(prompt_file, "rb");
-        if (fp) {
-            static char file_buf[8192];
-            size_t r = fread(file_buf, 1, sizeof(file_buf)-1, fp);
-            file_buf[r] = '\0';
-            prompt = file_buf;
-            fclose(fp);
-        }
-    }
-
     /* Scan special tokens */
     scan_special_tokens();
+    init_eog_tokens();
     gpt2_instruct_mode =
         m.arch == ARCH_GPT2 &&
         find_special_token("<|user|>") >= 0 &&
@@ -5489,247 +5904,85 @@ int main(int argc, char **argv) {
         if (tok_eos >= 0) eos_token = tok_eos;
     }
 
-    prompt_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
-
-    /* Build prompt tokens */
-    {
-        int tok_im_start = find_special_token("<|im_start|>");
-        int tok_im_end = find_special_token("<|im_end|>");
-        int tok_bos = find_special_token("<bos>");
-        int tok_endoftext = find_special_token("<|endoftext|>");
-        int tok_user = find_special_token("<|user|>");
-        int tok_assistant = find_special_token("<|assistant|>");
-        int auto_bos_id = hp.tokenizer_bos_token_id > 0 ? (int)hp.tokenizer_bos_token_id : -1;
-        if (tok_bos < 0) tok_bos = find_special_token("<s>");
-        if (auto_bos_id < 0) auto_bos_id = tok_bos;
-        if (auto_bos_id < 0) auto_bos_id = tok_endoftext;
-        int prompt_has_template =
-            contains_nocase(prompt, "<start_of_turn>") ||
-            contains_nocase(prompt, "<|im_start|>") ||
-            contains_nocase(prompt, "<|user|>") ||
-            contains_nocase(prompt, "<|assistant|>") ||
-            contains_nocase(prompt, "[INST]") ||
-            contains_nocase(prompt, "user:");
-        int n = 0;
-        int wrapped_prompt = 0;
-
-        if (gpt2_instruct_mode && !do_chat && !prompt_has_template) {
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: gpt2-instruct user/assistant style\n");
-            if (tok_user >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_user;
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
-            if (tok_assistant >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_assistant;
-        } else if (!do_chat && prompt_has_template) {
-            if (!g_clean_output) printf("Prompt already looks templated; using raw prompt text\n");
-            prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
-        } else if (qwen_chatml_mode) {
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: qwen ChatML special-token style\n");
-            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "user\n", m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "\n", m.vocab_size);
-            if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "\n", m.vocab_size);
-            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "assistant\n", m.vocab_size);
-        } else if (m.arch == ARCH_GPT2 || (!do_chat && !smollm2_mode && !qwen_chatml_mode && !tinyllama_mode && !gemma3_mode && !slopllm_mode)) {
-            prompt_len = tokenize(prompt, prompt_tokens, m.max_seq_len, m.vocab_size);
-        } else if (smollm2_mode) {
-            char *chat_buf;
-            size_t chat_cap;
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: smollm2 ChatML style\n");
-            chat_cap = strlen(prompt) + 256;
-            chat_buf = (char*)malloc(chat_cap);
-            if (!chat_buf) {
-                fprintf(stderr, "Failed to allocate SmolLM2 prompt buffer\n");
-                free(prompt_tokens);
-                free_runstate(&s);
+    if (do_repl) {
+        char repl_buf[8192];
+        char file_buf[8192];
+        if (do_interactive) {
+            print_banner();
+            printf("interactive mode\n");
+            printf("type /exit to quit\n\n");
+        } else if (!g_clean_output) {
+            printf("REPL mode: model stays loaded. Type /exit to quit.\n");
+        }
+        if (prompt_file) {
+            if (read_file_text(prompt_file, file_buf, sizeof(file_buf))) {
+                if (run_local_request(&m, ctx, &hp, model_path, file_buf, n_generate, temp, top_k, top_p, min_p,
+                                      eos_token, no_eos_stop, do_chat, do_raw_tokens,
+                                      gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
+                                      tinyllama_mode, gemma3_mode, slopllm_mode,
+                                      do_interactive, n_generate_user) != 0) {
+                    free_model(&m);
+                    gguf_free(ctx);
+                    if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
+                    if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
+                    return 1;
+                }
+            }
+        } else if (prompt && prompt[0]) {
+            if (run_local_request(&m, ctx, &hp, model_path, prompt, n_generate, temp, top_k, top_p, min_p,
+                                  eos_token, no_eos_stop, do_chat, do_raw_tokens,
+                                  gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
+                                  tinyllama_mode, gemma3_mode, slopllm_mode,
+                                  do_interactive, n_generate_user) != 0) {
                 free_model(&m);
                 gguf_free(ctx);
                 if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
                 if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
                 return 1;
             }
-            sprintf(chat_buf,
-                    "<|im_start|>system\n"
-                    "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
-                    "<|im_end|>\n"
-                    "<|im_start|>user\n"
-                    "%s"
-                    "<|im_end|>\n"
-                    "<|im_start|>assistant\n",
-                    prompt);
-            prompt_len = tokenize(chat_buf, prompt_tokens, m.max_seq_len, m.vocab_size);
-            free(chat_buf);
-            n = prompt_len;
-        } else if (gemma3_mode) {
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: gemma3 start_of_turn style (no system, with BOS)\n");
-            if (tok_bos >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_bos;
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>user\n", m.vocab_size);
-            n = append_sentencepiece_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<end_of_turn>\n", m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<start_of_turn>model\n", m.vocab_size);
-        } else if (tinyllama_mode) {
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "<s>[INST] ", m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " [/INST]", m.vocab_size);
-        } else if (slopllm_mode) {
-            wrapped_prompt = 1;
-            if (!g_clean_output) printf("Chat tokens: slopllm user/assistant style\n");
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, "user: ", m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, prompt, m.vocab_size);
-            n = append_text_tokens(prompt_tokens, m.max_seq_len, n, " assistant:", m.vocab_size);
-        } else {
-            wrapped_prompt = 1;
-            int tmp_tok[256];
-            int tmp_n;
-            if (tok_im_start < 0) tok_im_start = find_special_token("<s>"); /* fallback */
-            if (tok_im_end < 0) tok_im_end = find_special_token("</s>");  /* fallback to EOS */
-
-            if (!g_clean_output) {
-                printf("Chat tokens: im_start=%d im_end=%d\n", tok_im_start, tok_im_end);
-            }
-
-            /* <|im_start|> */
-            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-
-            /* "user\n" */
-            tmp_n = tokenize("user\n", tmp_tok, 256, m.vocab_size);
-            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-            /* user prompt */
-            tmp_n = tokenize(prompt, tmp_tok, 256, m.vocab_size);
-            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-            /* "\n" */
-            tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
-            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-            /*  =2 */
-            if (tok_im_end >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_end;
-
-            /* "\n" */
-            tmp_n = tokenize("\n", tmp_tok, 256, m.vocab_size);
-            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
-
-            /* <|im_start|> */
-            if (tok_im_start >= 0 && n < m.max_seq_len) prompt_tokens[n++] = tok_im_start;
-
-            /* "assistant\n" */
-            tmp_n = tokenize("assistant\n", tmp_tok, 256, m.vocab_size);
-            for (i = 0; i < tmp_n && n < m.max_seq_len; i++) prompt_tokens[n++] = tmp_tok[i];
         }
-
-        if (!wrapped_prompt && hp.tokenizer_add_bos_token && auto_bos_id >= 0 && prompt_len > 0 && prompt_len < m.max_seq_len) {
-            if (prompt_tokens[0] != auto_bos_id) {
-                memmove(prompt_tokens + 1, prompt_tokens, (size_t)prompt_len * sizeof(int));
-                prompt_tokens[0] = auto_bos_id;
-                prompt_len++;
+        for (;;) {
+            size_t len;
+            printf(">>> ");
+            if (!fgets(repl_buf, sizeof(repl_buf), stdin)) break;
+            len = strlen(repl_buf);
+            while (len > 0 && (repl_buf[len - 1] == '\n' || repl_buf[len - 1] == '\r')) {
+                repl_buf[--len] = '\0';
+            }
+            sanitize_repl_input(repl_buf);
+            if (strcmp(repl_buf, "/exit") == 0 || strcmp(repl_buf, "/quit") == 0) break;
+            if (repl_buf[0] == '\0') continue;
+            if (run_local_request(&m, ctx, &hp, model_path, repl_buf, n_generate, temp, top_k, top_p, min_p,
+                                  eos_token, no_eos_stop, do_chat, do_raw_tokens,
+                                  gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
+                                  tinyllama_mode, gemma3_mode, slopllm_mode,
+                                  do_interactive, n_generate_user) != 0) {
+                free_model(&m);
+                gguf_free(ctx);
+                if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
+                if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
+                return 1;
             }
         }
-        if (wrapped_prompt) prompt_len = n;
-    }
-
-    /* Debug: show first 30 prompt tokens */
-    if (!g_clean_output) {
-        printf("Prompt tokens (%d): ", prompt_len);
-        for (i = 0; i < prompt_len && i < 30; i++) {
-            printf("[%d]", prompt_tokens[i]);
-            if (g_vocab && prompt_tokens[i] >= 0 && prompt_tokens[i] < g_vocab_n) {
-                int tlen = g_vocab[prompt_tokens[i]].len;
-                if (tlen > 0 && tlen < 20) {
-                    printf("'");
-                    print_token_text_clean(g_vocab[prompt_tokens[i]].text, tlen);
-                    printf("' ");
-                }
-            }
-        }
-        printf("\n");
-    }
-
-    /* Process prompt tokens silently to fill KV cache */
-    t_request_start = now_seconds();
-    if (prompt_len > 1 && !g_clean_output) {
-        printf("Prefill %d tokens...", prompt_len);
-        fflush(stdout);
-    }
-    for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
-        forward(&m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
-        if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
-            printf(".");
-            fflush(stdout);
-        }
-    }
-
-    /* Last prompt token produces first generated token using sampling */
-    if (prompt_len > 1 && !g_clean_output) printf("\n");
-    if (prompt_len > 0) {
-        int ban_token = (!no_eos_stop && n_generate > 1) ? eos_token : -1;
-        next_token = forward(&m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
-        pos = prompt_len;
     } else {
-        /* Empty prompt: use BOS token as seed */
-        int ban_token = (!no_eos_stop && n_generate > 1) ? eos_token : -1;
-        next_token = forward(&m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
-        pos = 1;
+        char file_buf[8192];
+        const char *request_prompt = prompt;
+        if (prompt_file && read_file_text(prompt_file, file_buf, sizeof(file_buf))) {
+            request_prompt = file_buf;
+        }
+        if (run_local_request(&m, ctx, &hp, model_path, request_prompt, n_generate, temp, top_k, top_p, min_p,
+                              eos_token, no_eos_stop, do_chat, do_raw_tokens,
+                              gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
+                              tinyllama_mode, gemma3_mode, slopllm_mode,
+                              0, n_generate_user) != 0) {
+            free_model(&m);
+            gguf_free(ctx);
+            if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
+            if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
+            return 1;
+        }
     }
 
-    /* Generation: stream tokens */
-    {
-        int *last_tokens = (int*)malloc(m.max_seq_len * sizeof(int));
-        int n_last = 0;
-        /* Print first generated token immediately */
-        if (tokens_printed == 0) t_first_token = now_seconds();
-        if (do_raw_tokens) {
-            printf("[%d]", next_token);
-        } else if (next_token != 0) {
-            detokenize(next_token, m.vocab_size);
-        } else {
-            printf("<|endoftext|>");
-        }
-        fflush(stdout);
-        if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
-        tokens_printed++;
-        for (i = 1; i < n_generate; i++) {
-            int ban_token = (!no_eos_stop && i + 1 < n_generate) ? eos_token : -1;
-            if (pos >= m.max_seq_len) break;
-            next_token = forward(&m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, ban_token, 1);
-            pos++;
-            if (do_raw_tokens) {
-                printf("[%d]", next_token);
-            } else if (next_token != 0) {
-                detokenize(next_token, m.vocab_size);
-            } else {
-                printf("<|endoftext|>");
-            }
-            if (tokens_printed == 0) t_first_token = now_seconds();
-            if (n_last < m.max_seq_len) last_tokens[n_last++] = next_token;
-            tokens_printed++;
-            fflush(stdout);
-        }
-        free(last_tokens);
-    }
-    printf("\n");
-    t_end = now_seconds();
-    if (tokens_printed > 0) {
-        double ttft_s = t_first_token - t_request_start;
-        double gen_s = t_end - t_first_token;
-        double tps = 0.0;
-        int gen_tokens = tokens_printed > 1 ? (tokens_printed - 1) : 0;
-        if (gen_tokens > 0 && gen_s > 0.0) tps = (double)gen_tokens / gen_s;
-        printf("Stats: TTFT=%.3fs, TPS=%.2f tok/s, output=%d tokens, prompt=%d tokens, total=%.3fs\n",
-               ttft_s, tps, tokens_printed, prompt_len, t_end - t_request_start);
-    } else {
-        printf("Stats: no tokens produced, total=%.3fs\n", t_end - t_request_start);
-    }
-
-    free(prompt_tokens);
-    free_runstate(&s);
     free_model(&m);
     gguf_free(ctx);
     if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
