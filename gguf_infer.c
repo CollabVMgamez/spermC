@@ -219,6 +219,7 @@ static int g_gpt2_add_space_prefix = 0;
 static int g_legacy_windows = -1;
 static int g_eog_tokens[8];
 static int g_eog_token_count = 0;
+static int *g_token_types = NULL;
 static StrIdEntry *g_token_lookup = NULL;
 static int g_token_lookup_cap = 0;
 static BpePairEntry *g_bpe_pairs = NULL;
@@ -230,6 +231,7 @@ static int probe_tensor_section(const u8 *base, size_t size, u64 offset, u64 ten
 static int is_legacy_windows(void);
 static void gguf_free(GGUFContext *ctx);
 static void print_token_text_clean(const char *text, int len);
+static int token_is_blocked_for_generation(int tok);
 
 #define MATVEC_POOL_MAX_THREADS 8
 
@@ -519,6 +521,36 @@ static int template_mentions(const HParams *hp, const char *needle) {
     return contains_nocase(hp->architecture, needle) ||
            contains_nocase(hp->tokenizer_pre, needle) ||
            contains_nocase(hp->chat_template, needle);
+}
+
+static Arch detect_architecture_name(const char *arch_name) {
+    if (!arch_name || !arch_name[0]) return ARCH_LLAMA;
+    if (strstr(arch_name, "gpt2")) return ARCH_GPT2;
+    if (strstr(arch_name, "qwen3")) return ARCH_QWEN3;
+    if (strstr(arch_name, "qwen2.5") || strstr(arch_name, "qwen25")) return ARCH_QWEN25;
+    if (strstr(arch_name, "qwen2")) return ARCH_QWEN2;
+    if (strstr(arch_name, "qwen")) return ARCH_QWEN2;
+    if (strstr(arch_name, "gemma3")) return ARCH_GEMMA3;
+    if (strstr(arch_name, "gemma2")) return ARCH_GEMMA2;
+    if (strstr(arch_name, "gemma")) return ARCH_GEMMA;
+    if (strstr(arch_name, "phi4")) return ARCH_PHI4;
+    if (strstr(arch_name, "phi3")) return ARCH_PHI3;
+    if (strstr(arch_name, "phi")) return ARCH_PHI;
+    if (strstr(arch_name, "mistral")) return ARCH_MISTRAL;
+    if (strstr(arch_name, "mixtral")) return ARCH_MIXTRAL;
+    if (strstr(arch_name, "falcon")) return ARCH_FALCON;
+    if (strstr(arch_name, "deepseek")) return ARCH_DEEPSEEK;
+    if (strstr(arch_name, "granite")) return ARCH_GRANITE;
+    if (strstr(arch_name, "yi")) return ARCH_YI;
+    if (strstr(arch_name, "baichuan")) return ARCH_BAICHUAN;
+    if (strstr(arch_name, "stablelm")) return ARCH_STABLELM;
+    if (strstr(arch_name, "command-r")) return ARCH_COMMAND_R;
+    if (strstr(arch_name, "codellama")) return ARCH_CODELLAMA;
+    if (strstr(arch_name, "nemo")) return ARCH_NEMO;
+    if (strstr(arch_name, "llama4")) return ARCH_LLAMA4;
+    if (strstr(arch_name, "llama3")) return ARCH_LLAMA3;
+    if (strstr(arch_name, "llama2")) return ARCH_LLAMA2;
+    return ARCH_LLAMA;
 }
 
 static void free_gpt2_tokenizer_tables(void) {
@@ -911,6 +943,7 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
     u64 merge_count = 0;
     u64 merge_buf_size = 0;
     if (g_tok_buf) { free(g_tok_buf); g_tok_buf = NULL; free(g_vocab); g_vocab = NULL; }
+    if (g_token_types) { free(g_token_types); g_token_types = NULL; }
     if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; }
     g_sorted_init = 0;
     free_gpt2_tokenizer_tables();
@@ -968,6 +1001,23 @@ static int load_tokenizer_from_gguf(GGUFContext *ctx) {
                 }
         if (!g_clean_output) printf("Loaded tokenizer from GGUF: %d tokens\n", g_vocab_n);
                 rebuild_byte_token_map();
+            }
+        } else if (strcmp(key, "tokenizer.ggml.token_type") == 0 && vtype == 9) {
+            atype = read_u32(&p);
+            len = read_u64(&p);
+            if (atype == 5 && len > 0 && len < 1000000) {
+                u64 k;
+                if (g_token_types) { free(g_token_types); g_token_types = NULL; }
+                g_token_types = (int*)malloc(sizeof(int) * (size_t)len);
+                if (!g_token_types) return 0;
+                for (k = 0; k < len; k++) {
+                    int tv;
+                    memcpy(&tv, p, 4);
+                    p += 4;
+                    g_token_types[k] = tv;
+                }
+            } else {
+                skip_value(vtype, &p);
             }
         } else if (want_gpt2 && strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == 9) {
             atype = read_u32(&p);
@@ -1663,6 +1713,9 @@ static float clamp_nonfinite(float v) {
 static int sample_topk(float *logits, int n, float temp, int top_k, float top_p, float min_p, int ban_token) {
     int i, k;
     float maxv, sum, r, cdf;
+    for (i = 0; i < n; i++) {
+        if (token_is_blocked_for_generation(i)) logits[i] = -1e30f;
+    }
     if (!g_allow_eog_sampling) {
         for (i = 0; i < g_eog_token_count; i++) {
             int tok = g_eog_tokens[i];
@@ -2522,6 +2575,32 @@ static int is_legacy_windows(void) {
 #endif
 }
 
+static size_t legacy_cache_budget_bytes(size_t default_budget) {
+#ifdef _WIN32
+    MEMORYSTATUS ms;
+    size_t phys;
+    size_t budget;
+
+    if (!is_legacy_windows()) return default_budget;
+    memset(&ms, 0, sizeof(ms));
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatus(&ms);
+    phys = (size_t)ms.dwTotalPhys;
+    if (phys == 0) {
+        if (default_budget > (512U * 1024U * 1024U)) return 512U * 1024U * 1024U;
+        return default_budget;
+    }
+
+    budget = phys / 2;
+    if (budget < (256U * 1024U * 1024U)) budget = 256U * 1024U * 1024U;
+    if (budget > (1280U * 1024U * 1024U)) budget = 1280U * 1024U * 1024U;
+    if (budget > default_budget) budget = default_budget;
+    return budget;
+#else
+    return default_budget;
+#endif
+}
+
 static int default_thread_count(void) {
 #ifdef _WIN32
     DWORD_PTR processMask = 0, systemMask = 0;
@@ -2602,9 +2681,9 @@ static int pick_matvec_threads(int n, int d) {
     if (thread_count > MATVEC_POOL_MAX_THREADS) thread_count = MATVEC_POOL_MAX_THREADS;
     if (thread_count > n) thread_count = n;
     if (is_legacy_windows()) {
-        if (thread_count > 4) thread_count = 4;
+        if (thread_count > 8) thread_count = 8;
         if (work < 250000ULL) thread_count = 1;
-        else if (work < 600000ULL && thread_count > 3) thread_count = 3;
+        else if (work < 600000ULL && thread_count > 4) thread_count = 4;
         if (thread_count < 1) thread_count = 1;
         return thread_count;
     }
@@ -2981,13 +3060,6 @@ static void matvec_parallel(const Tensor *t, const float *x, float *y, int n, in
         return;
     }
 
-    /* On legacy Windows, only use the threaded row-major path for already-cached
-       plain F32/F16 tensors. Keep quantized and transposed paths serial. */
-    if (is_legacy_windows() && t->type != 0 && t->type != 1) {
-        matvec_no_parallel(t, x, y, n, d, NULL);
-        return;
-    }
-
     /* Only parallelize standard GGML row access: dims[0] = d, dims[1] = n */
     if (!((int)t->dims[0] == d && (int)t->dims[1] == n)) {
         matvec_no_parallel(t, x, y, n, d, NULL);
@@ -3325,6 +3397,10 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     int prefer_output_cache = 0;
     int legacy_windows = is_legacy_windows();
 
+    if (legacy_windows) {
+        cache_budget = legacy_cache_budget_bytes(cache_budget);
+    }
+
     t = find_tensor(ctx, "token_embd.weight");
     if (!t) t = find_tensor(ctx, "tok_embeddings.weight");
     if (!t) t = find_tensor(ctx, "model.embed_tokens.weight");
@@ -3339,7 +3415,10 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         return 1;
     }
     m->tok_embd = t;
-    /* GGML/GGUF embeddings are normally stored as [dim, vocab]. */
+    /* GGML 2D tensors are stored with dims[0] as row width and dims[1] as row count.
+       token_embd.weight is therefore already logical [vocab rows][dim cols] when
+       dims[0] = dim and dims[1] = vocab. Only treat it as transposed when the larger
+       vocab axis is in dims[0]. */
     if (t->dims[0] <= t->dims[1]) {
         m->dim = (int)t->dims[0];
         m->vocab_size = (int)t->dims[1];
@@ -3370,32 +3449,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     if (t) m->output = t; else m->output = m->tok_embd;
 
     /* Architecture detection */
-    m->arch = ARCH_LLAMA;
-    if (strstr(hp->architecture, "gpt2")) m->arch = ARCH_GPT2;
-    else if (strstr(hp->architecture, "qwen3")) m->arch = ARCH_QWEN3;
-    else if (strstr(hp->architecture, "qwen2.5") || strstr(hp->architecture, "qwen25")) m->arch = ARCH_QWEN25;
-    else if (strstr(hp->architecture, "qwen2")) m->arch = ARCH_QWEN2;
-    else if (strstr(hp->architecture, "qwen")) m->arch = ARCH_QWEN2;
-    else if (strstr(hp->architecture, "gemma3")) m->arch = ARCH_GEMMA3;
-    else if (strstr(hp->architecture, "gemma2")) m->arch = ARCH_GEMMA2;
-    else if (strstr(hp->architecture, "gemma")) m->arch = ARCH_GEMMA;
-    else if (strstr(hp->architecture, "phi4")) m->arch = ARCH_PHI4;
-    else if (strstr(hp->architecture, "phi3")) m->arch = ARCH_PHI3;
-    else if (strstr(hp->architecture, "phi")) m->arch = ARCH_PHI;
-    else if (strstr(hp->architecture, "mistral")) m->arch = ARCH_MISTRAL;
-    else if (strstr(hp->architecture, "mixtral")) m->arch = ARCH_MIXTRAL;
-    else if (strstr(hp->architecture, "falcon")) m->arch = ARCH_FALCON;
-    else if (strstr(hp->architecture, "deepseek")) m->arch = ARCH_DEEPSEEK;
-    else if (strstr(hp->architecture, "granite")) m->arch = ARCH_GRANITE;
-    else if (strstr(hp->architecture, "yi")) m->arch = ARCH_YI;
-    else if (strstr(hp->architecture, "baichuan")) m->arch = ARCH_BAICHUAN;
-    else if (strstr(hp->architecture, "stablelm")) m->arch = ARCH_STABLELM;
-    else if (strstr(hp->architecture, "command-r")) m->arch = ARCH_COMMAND_R;
-    else if (strstr(hp->architecture, "codellama")) m->arch = ARCH_CODELLAMA;
-    else if (strstr(hp->architecture, "nemo")) m->arch = ARCH_NEMO;
-    else if (strstr(hp->architecture, "llama4")) m->arch = ARCH_LLAMA4;
-    else if (strstr(hp->architecture, "llama3")) m->arch = ARCH_LLAMA3;
-    else if (strstr(hp->architecture, "llama2")) m->arch = ARCH_LLAMA2;
+    m->arch = detect_architecture_name(hp->architecture);
 
     if (m->arch == ARCH_QWEN2 || m->arch == ARCH_QWEN3 || m->arch == ARCH_QWEN25) {
         prefer_output_cache = 1;
@@ -3491,7 +3545,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     if (hp->attention_sliding_window > 0) m->attention_sliding_window = (int)hp->attention_sliding_window;
     else m->attention_sliding_window = 1024;
 
-    if (!legacy_windows && m->tok_embd_transposed && m->arch != ARCH_GPT2 && !prefer_output_cache) {
+    if (!legacy_windows && m->tok_embd_transposed && m->arch != ARCH_GPT2 && m->arch != ARCH_GEMMA3 && !prefer_output_cache) {
         size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(float);
         if (cache_bytes <= cache_budget - cache_used) {
             if (!g_clean_output) printf("Caching transposed token embeddings in F32 for speed...\n");
@@ -3571,6 +3625,32 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
     }
 
+    if (m->arch == ARCH_GEMMA3 &&
+        !m->cached_embd &&
+        m->output == m->tok_embd &&
+        m->tok_embd &&
+        m->tok_embd->type != 0) {
+        size_t cache_bytes = tensor_f32_cache_bytes(m->tok_embd);
+        if (cache_bytes <= cache_budget - cache_used) {
+            if (!g_clean_output) printf("Caching Gemma3 token/output matrix in F32 for speed...\n");
+            if (!cache_tensor_f32_inplace(m->tok_embd)) {
+                fprintf(stderr, "Warning: failed to cache Gemma3 token/output matrix (%u MB)\n",
+                        (unsigned int)(cache_bytes / (1024U * 1024U)));
+            } else {
+                m->cached_embd = (float*)m->tok_embd->data;
+                m->cached_output = m->cached_embd;
+                cache_used += cache_bytes;
+                if (!g_clean_output) printf("Gemma3 token/output cache ready.\n");
+            }
+        } else {
+            if (!g_clean_output) {
+                printf("Skipping Gemma3 token/output cache (%u MB needed, %u MB budget left)\n",
+                       (unsigned int)(cache_bytes / (1024U * 1024U)),
+                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+            }
+        }
+    }
+
     if (seq_user > 0) m->max_seq_len = seq_user;
     else if (hp->context_length > 0) m->max_seq_len = (int)hp->context_length;
     else m->max_seq_len = 2048;
@@ -3598,10 +3678,6 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         int p, k;
         float local_theta = m->rope_theta;
         float global_theta = m->rope_theta;
-        if (m->arch == ARCH_GEMMA3) {
-            local_theta = 10000.0f;
-            global_theta = (hp->rope_freq_base != 0.0f) ? hp->rope_freq_base : 1000000.0f;
-        }
         float *cos_tab = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
         float *sin_tab = (float*)malloc((size_t)m->max_seq_len * half * sizeof(float));
         if (!cos_tab || !sin_tab) {
@@ -3855,7 +3931,7 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
     }
 
-    if (!legacy_windows) {
+    {
         int l;
         int cached_count = 0;
         int skipped_count = 0;
@@ -3957,8 +4033,6 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         }
 hot_cache_done:
         ;
-    } else {
-        if (!g_clean_output) printf("Skipping hot-weight cache for this model/runtime.\n");
     }
 
     if (!legacy_windows &&
@@ -4013,7 +4087,8 @@ hot_cache_done:
                hp->architecture);
     }
     if (legacy_windows) {
-        printf("Legacy Windows mode: conservative matvec/cache path enabled\n");
+        printf("Legacy Windows mode: conservative matvec/cache path enabled (cache budget %u MB)\n",
+               (unsigned int)(cache_budget / (1024U * 1024U)));
     }
     return 0;
 }
@@ -4306,8 +4381,9 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
     } else {
         load_transposed_embedding_fast(m->tok_embd, x, token, dim, vocab_size);
     }
-    if (m->arch == ARCH_GEMMA3 && !g_clean_output && vector_has_nan(x, dim)) {
-        printf("Gemma3 debug: NaN in token embedding for token %d\n", token);
+    if (is_gemma_family) {
+        float emb_scale = (float)sqrt((double)dim);
+        for (i = 0; i < dim; i++) x[i] *= emb_scale;
     }
 
     for (l = 0; l < n_layers; l++) {
@@ -4317,29 +4393,20 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         const float *rope_sin = m->rope_sin;
         /* Attention */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
-        rmsnorm_ex(x, (float*)m->attn_norm[l]->data, dim, m->norm_eps, is_gemma_family);
+        rmsnorm(x, (float*)m->attn_norm[l]->data, dim, m->norm_eps);
 
         matvec(m->attn_q[l], x, q, q_dim, dim, s->dq_row);
         matvec(m->attn_k[l], x, k, kv_dim, dim, s->dq_row);
         matvec(m->attn_v[l], x, v, kv_dim, dim, s->dq_row);
-        if (is_gemma3 && !g_clean_output && l == 0) {
-            if (vector_has_nan(q, q_dim)) printf("Gemma3 debug: NaN in q after attn_q\n");
-            if (vector_has_nan(k, kv_dim)) printf("Gemma3 debug: NaN in k after attn_k\n");
-            if (vector_has_nan(v, kv_dim)) printf("Gemma3 debug: NaN in v after attn_v\n");
-        }
 
         if (m->attn_q_norm[l] && m->attn_q_norm[l]->data) {
-            for (h = 0; h < n_heads; h++) rmsnorm_ex(q + h * head_dim, (float*)m->attn_q_norm[l]->data, head_dim, m->norm_eps, is_gemma_family);
+            for (h = 0; h < n_heads; h++) rmsnorm(q + h * head_dim, (float*)m->attn_q_norm[l]->data, head_dim, m->norm_eps);
         }
         if (m->attn_k_norm[l] && m->attn_k_norm[l]->data) {
-            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rmsnorm_ex(k + h_kv * head_dim, (float*)m->attn_k_norm[l]->data, head_dim, m->norm_eps, is_gemma_family);
+            for (h_kv = 0; h_kv < n_kv_heads; h_kv++) rmsnorm(k + h_kv * head_dim, (float*)m->attn_k_norm[l]->data, head_dim, m->norm_eps);
         }
 
         if (is_gemma3) {
-            if (!g_clean_output && l == 0) {
-                if (vector_has_nan(q, q_dim)) printf("Gemma3 debug: NaN in q after q_norm\n");
-                if (vector_has_nan(k, kv_dim)) printf("Gemma3 debug: NaN in k after k_norm\n");
-            }
             if (is_global_layer && m->rope_cos_global && m->rope_sin_global) {
                 rope_cos = m->rope_cos_global;
                 rope_sin = m->rope_sin_global;
@@ -4413,13 +4480,13 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
         matvec(m->attn_o[l], attn_out, x, dim, q_dim, s->dq_row);
         if (is_gemma_family && m->post_attn_norm[l] && m->post_attn_norm[l]->data) {
-            rmsnorm_ex(x, (float*)m->post_attn_norm[l]->data, dim, m->norm_eps, 1);
+            rmsnorm(x, (float*)m->post_attn_norm[l]->data, dim, m->norm_eps);
         }
         for (i = 0; i < dim; i++) x[i] += tmp[i];
 
         /* FFN */
         for (i = 0; i < dim; i++) tmp[i] = x[i];
-        rmsnorm_ex(x, (float*)m->ffn_norm[l]->data, dim, m->norm_eps, is_gemma_family);
+        rmsnorm(x, (float*)m->ffn_norm[l]->data, dim, m->norm_eps);
 
         matvec(m->ffn_gate[l], x, s->ffn_gate, hidden_dim, dim, s->dq_row);
         matvec(m->ffn_up[l], x, s->ffn_up, hidden_dim, dim, s->dq_row);
@@ -4431,14 +4498,14 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
 
         matvec(m->ffn_down[l], s->ffn_hidden, x, dim, hidden_dim, s->dq_row);
         if (is_gemma_family && m->post_ffn_norm[l] && m->post_ffn_norm[l]->data) {
-            rmsnorm_ex(x, (float*)m->post_ffn_norm[l]->data, dim, m->norm_eps, 1);
+            rmsnorm(x, (float*)m->post_ffn_norm[l]->data, dim, m->norm_eps);
         }
         for (i = 0; i < dim; i++) x[i] += tmp[i];
     }
 
     if (!compute_logits) return 0;
 
-    rmsnorm_ex(x, (float*)m->output_norm->data, dim, m->norm_eps, is_gemma_family);
+    rmsnorm(x, (float*)m->output_norm->data, dim, m->norm_eps);
     if (m->cached_output) {
         Tensor fake;
         fake = *m->output;
@@ -4471,39 +4538,6 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         for (i = 0; i < vocab_size; i++) s->logits[i] = softcap(s->logits[i], final_softcap);
     } else if (use_gemma_softcaps) {
         for (i = 0; i < vocab_size; i++) s->logits[i] = softcap(s->logits[i], 30.0f);
-    }
-    if (m->arch == ARCH_GEMMA3 && !g_clean_output && ban_token >= 0) {
-        int best[5];
-        float bestv[5];
-        int bi, bj;
-        for (bi = 0; bi < 5; bi++) { best[bi] = -1; bestv[bi] = -1e30f; }
-        for (bi = 0; bi < vocab_size; bi++) {
-            float v0 = s->logits[bi];
-            for (bj = 0; bj < 5; bj++) {
-                if (v0 > bestv[bj]) {
-                    int kk;
-                    for (kk = 4; kk > bj; kk--) {
-                        bestv[kk] = bestv[kk - 1];
-                        best[kk] = best[kk - 1];
-                    }
-                    bestv[bj] = v0;
-                    best[bj] = bi;
-                    break;
-                }
-            }
-        }
-        printf("Gemma3 logits top5:");
-        for (bi = 0; bi < 5; bi++) {
-            if (best[bi] >= 0) {
-                printf(" %d=%.4f", best[bi], bestv[bi]);
-                if (g_vocab && best[bi] < g_vocab_n && g_vocab[best[bi]].len > 0 && g_vocab[best[bi]].len < 32) {
-                    printf(" '");
-                    print_token_text_clean(g_vocab[best[bi]].text, g_vocab[best[bi]].len);
-                    printf("'");
-                }
-            }
-        }
-        printf("\n");
     }
     /* Repetition penalty: discourage recent tokens */
     if (recent && recent_n > 0) {
@@ -4834,10 +4868,10 @@ static void scan_special_tokens(void) {
 }
 
 static void init_eog_tokens(void) {
-    const char *names[4] = { "<|endoftext|>", "<|im_end|>", "<reponame>", "</s>" };
+    const char *names[6] = { "<|endoftext|>", "<|im_end|>", "<reponame>", "</s>", "<eos>", "<end_of_turn>" };
     int i;
     g_eog_token_count = 0;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 6; i++) {
         int tok = find_special_token(names[i]);
         int j;
         if (tok < 0) continue;
@@ -4848,6 +4882,33 @@ static void init_eog_tokens(void) {
             g_eog_tokens[g_eog_token_count++] = tok;
         }
     }
+}
+
+#define TOKEN_TYPE_NORMAL 1
+#define TOKEN_TYPE_UNKNOWN 2
+#define TOKEN_TYPE_CONTROL 3
+#define TOKEN_TYPE_USER_DEFINED 4
+#define TOKEN_TYPE_UNUSED 5
+
+static int is_eog_token_id(int tok) {
+    int i;
+    for (i = 0; i < g_eog_token_count; i++) {
+        if (g_eog_tokens[i] == tok) return 1;
+    }
+    return 0;
+}
+
+static int token_is_blocked_for_generation(int tok) {
+    int type;
+    if (!g_vocab || tok < 0 || tok >= g_vocab_n) return 0;
+    if (g_eog_token_count > 0 && is_eog_token_id(tok)) return 0;
+    if (g_vocab[tok].len <= 0) return 1;
+    if (!g_token_types || tok >= g_vocab_n) return 0;
+    type = g_token_types[tok];
+    if (type == TOKEN_TYPE_UNKNOWN || type == TOKEN_TYPE_CONTROL) {
+        return 1;
+    }
+    return 0;
 }
 
 static int is_eog_token(int tok, int eos_token) {
@@ -5221,7 +5282,7 @@ static int http_post_json(const char *url, const char *api_key, const char *body
         FreeLibrary(dll);
         return 0;
     }
-    hSession = pOpen(L"spermC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    hSession = pOpen(L"spermC/2.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) goto cleanup;
     hConnect = pConnect(hSession, w_host, port, 0);
@@ -5640,6 +5701,7 @@ int main(int argc, char **argv) {
     GGUFContext *ctx;
     Model m;
     HParams hp;
+    Arch parsed_arch;
     char *model_path = NULL;
     char *tok_path = NULL;
     char *prompt = "";
@@ -5773,7 +5835,7 @@ int main(int argc, char **argv) {
     srand(seed);
 
     if (!g_clean_output) {
-        printf("spermC v1 (multi-arch + sorted tokenizer)\n");
+        printf("spermC v2 (multi-arch + sorted tokenizer)\n");
         printf("Threads: %d\n", g_n_threads);
     }
 
@@ -5816,19 +5878,23 @@ int main(int argc, char **argv) {
         printf("  Rope freq base: %.0f\n", (double)ctx->hp.rope_freq_base);
         printf("  Attn logit softcap: %.6g\n", (double)ctx->hp.attn_logit_softcapping);
         printf("  Final logit softcap: %.6g\n", (double)ctx->hp.final_logit_softcapping);
+        if (ctx->hp.chat_template[0]) {
+            printf("  Chat template: %s\n", ctx->hp.chat_template);
+        }
         gguf_free(ctx);
         return 0;
     }
 
     hp = ctx->hp;
-    gemma3_mode = (m.arch == ARCH_GEMMA3) ||
+    parsed_arch = detect_architecture_name(hp.architecture);
+    gemma3_mode = (parsed_arch == ARCH_GEMMA3) ||
                   template_mentions(&hp, "start_of_turn");
     {
-        int gemma3_270m_mode = (m.arch == ARCH_GEMMA3) &&
+        int gemma3_270m_mode = (parsed_arch == ARCH_GEMMA3) &&
                                hp.embedding_length == 640 &&
                                hp.block_count == 18 &&
                                hp.attention_head_count == 4;
-        if (gemma3_270m_mode || m.arch == ARCH_GEMMA3) {
+        if (gemma3_270m_mode || parsed_arch == ARCH_GEMMA3) {
             if (!temp_user) temp = 1.0f;
             if (!top_k_user) top_k = 64;
             if (!top_p_user) top_p = 0.95f;
@@ -5841,13 +5907,13 @@ int main(int argc, char **argv) {
     }
     smollm2_mode = (template_mentions(&hp, "<|im_start|>") ||
                     template_mentions(&hp, "smollm")) &&
-                   !(m.arch == ARCH_QWEN2 ||
-                     m.arch == ARCH_QWEN3 ||
-                     m.arch == ARCH_QWEN25 ||
+                   !(parsed_arch == ARCH_QWEN2 ||
+                     parsed_arch == ARCH_QWEN3 ||
+                     parsed_arch == ARCH_QWEN25 ||
                      contains_nocase(hp.tokenizer_pre, "qwen"));
-    qwen_chatml_mode = (m.arch == ARCH_QWEN2 ||
-                        m.arch == ARCH_QWEN3 ||
-                        m.arch == ARCH_QWEN25 ||
+    qwen_chatml_mode = (parsed_arch == ARCH_QWEN2 ||
+                        parsed_arch == ARCH_QWEN3 ||
+                        parsed_arch == ARCH_QWEN25 ||
                         contains_nocase(hp.tokenizer_pre, "qwen")) &&
                        template_mentions(&hp, "<|im_start|>") &&
                        (do_chat ||

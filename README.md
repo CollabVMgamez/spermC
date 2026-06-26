@@ -1,4 +1,4 @@
-# windows2000ai
+# spermC v2
 
 Single-file GGUF inference engine for old Windows targets, built and tested on Windows 11 host machines.
 
@@ -27,7 +27,7 @@ The script uses `cl.exe` if available, otherwise `gcc.exe`.
 ## Usage
 
 ```bat
-gguf_infer.exe <model.gguf> [options]
+spermC.exe <model.gguf> [options]
 ```
 
 Common options:
@@ -58,26 +58,26 @@ Common options:
 TinyLlama:
 
 ```bat
-gguf_infer.exe C:\Users\maxwe\Downloads\TinyLLama-v0.Q8_0.gguf --prompt hi -n 8 -t 0 --threads auto
+spermC.exe C:\Users\maxwe\Downloads\TinyLLama-v0.Q8_0.gguf --prompt hi -n 8 -t 0 --threads auto
 ```
 
 SmolLM2:
 
 ```bat
-gguf_infer.exe C:\Users\maxwe\Downloads\SmolLM2-135M-Instruct-Q4_K_M.gguf --prompt hi -n 8 -t 0 --threads auto
+spermC.exe C:\Users\maxwe\Downloads\SmolLM2-135M-Instruct-Q4_K_M.gguf --prompt hi -n 8 -t 0 --threads auto
 ```
 
 Gemma 3:
 
 ```bat
-gguf_infer.exe C:\Users\maxwe\Downloads\gemma-3-270m-it-Q4_K_M.gguf --prompt hi -n 8 --threads auto
+spermC.exe C:\Users\maxwe\Downloads\gemma-3-270m-it-Q4_K_M.gguf --prompt hi -n 8 --threads auto
 ```
 
 API mode:
 
 ```bat
 set OPENAI_API_KEY=...
-gguf_infer.exe gemma-3-270m-it-Q4_K_M --api --api-model gpt-4o-mini --prompt hi -n 8
+spermC.exe gemma-3-270m-it-Q4_K_M --api --api-model gpt-4o-mini --prompt hi -n 8
 ```
 
 ## Notes
