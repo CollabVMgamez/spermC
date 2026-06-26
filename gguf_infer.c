@@ -158,6 +158,9 @@ typedef struct {
     float *cached_embd;      /* exact f32 cache for transposed token embeddings/output */
     float *cached_output;    /* exact f32 cache for transposed output head */
     float *cached_pos_embd;  /* exact f32 cache for transposed position embeddings */
+    void *cached_tok_output_f16;
+    Tensor cached_tok_output_tensor;
+    int has_cached_tok_output_tensor;
     float *rope_cos;         /* precomputed RoPE cos table [max_seq_len][head_dim/2] */
     float *rope_sin;         /* precomputed RoPE sin table [max_seq_len][head_dim/2] */
     float *rope_cos_global;
@@ -197,6 +200,14 @@ typedef struct {
     float *dq_row;
 } RunState;
 
+typedef struct {
+    int valid;
+    int prefix_tokens;
+    int prefix_capacity_tokens;
+    float *k_cache;
+    float *v_cache;
+} PromptPrefixCache;
+
 typedef struct { int len; char *text; } TokenEntry;
 typedef struct { const char *key; int id; } StrIdEntry;
 typedef struct { int left; int right; int rank; int new_id; } BpePairEntry;
@@ -232,8 +243,11 @@ static int is_legacy_windows(void);
 static void gguf_free(GGUFContext *ctx);
 static void print_token_text_clean(const char *text, int len);
 static int token_is_blocked_for_generation(int tok);
+static int alloc_runstate(Model *m, RunState *s, GGUFContext *ctx);
+static void free_runstate(RunState *s);
+static int forward(Model *m, RunState *s, int token, int pos, float temp, int top_k, float top_p, float min_p, int *recent, int recent_n, int ban_token, int compute_logits);
 
-#define MATVEC_POOL_MAX_THREADS 8
+#define MATVEC_POOL_MAX_THREADS 16
 
 static int contains_nocase(const char *haystack, const char *needle) {
     size_t nlen, i;
@@ -329,6 +343,7 @@ static int read_meta_u32_value(u32 type, u8 **p, u32 *out) {
             return 0;
     }
 }
+
 
 static int read_meta_float_value(u32 type, u8 **p, float *out) {
     if (!p || !*p || !out) return 0;
@@ -927,6 +942,80 @@ static void detokenize_gpt2(int token) {
             putchar((char)byte);
         } else if (byte == ' ') {
             putchar(' ');
+        }
+        pos += used > 0 ? used : 1;
+    }
+}
+
+static void append_char_safe(char *dst, size_t cap, size_t *len, char c) {
+    if (!dst || !len || cap == 0) return;
+    if (*len + 1 >= cap) return;
+    dst[*len] = c;
+    (*len)++;
+    dst[*len] = '\0';
+}
+
+static void append_token_text_clean(char *dst, size_t cap, size_t *len, const char *text, int tlen) {
+    int i = 0;
+    while (i < tlen) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '<' && i + 5 < tlen &&
+            text[i + 1] == '0' &&
+            text[i + 2] == 'x' &&
+            isxdigit((unsigned char)text[i + 3]) &&
+            isxdigit((unsigned char)text[i + 4]) &&
+            text[i + 5] == '>') {
+            i += 6;
+            continue;
+        }
+        if (c < 0x80) {
+            if (c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c < 127)) {
+                append_char_safe(dst, cap, len, (char)c);
+            } else if (c == ' ') {
+                append_char_safe(dst, cap, len, ' ');
+            }
+            i++;
+        } else if (i + 2 < tlen &&
+                   (unsigned char)text[i + 0] == 0xE2 &&
+                   (unsigned char)text[i + 1] == 0x96 &&
+                   (unsigned char)text[i + 2] == 0x81) {
+            append_char_safe(dst, cap, len, ' ');
+            i += 3;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < tlen) {
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < tlen) {
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < tlen) {
+            i += 4;
+        } else {
+            i++;
+        }
+    }
+}
+
+static void detokenize_gpt2_to_buffer(int token, char *dst, size_t cap, size_t *len) {
+    const char *text;
+    int pos, tlen;
+    if (token == 0 || !dst || !len || cap == 0) return;
+    if (!g_vocab || token < 0 || token >= g_vocab_n) return;
+    text = g_vocab[token].text;
+    tlen = g_vocab[token].len;
+    if (!text || tlen <= 0) return;
+    if (text[0] == '<') {
+        append_token_text_clean(dst, cap, len, text, tlen);
+        return;
+    }
+    pos = 0;
+    while (pos < tlen) {
+        int used = 0;
+        unsigned int cp = utf8_decode_one((const unsigned char*)text + pos, tlen - pos, &used);
+        int byte = -1;
+        if (cp < 65536) byte = g_gpt2_codepoint_to_byte[cp];
+        if (byte < 0) byte = (int)(unsigned char)text[pos];
+        if (byte == '\n' || byte == '\r' || byte == '\t' || (byte >= 32 && byte < 127)) {
+            append_char_safe(dst, cap, len, (char)byte);
+        } else if (byte == ' ') {
+            append_char_safe(dst, cap, len, ' ');
         }
         pos += used > 0 ? used : 1;
     }
@@ -1852,6 +1941,7 @@ static void matvec_f32(const float *w, const float *x, float *y, int n, int d) {
 }
 
 static float fp16_to_fp32(u16 h);
+static u16 fp32_to_fp16(float f);
 static float tensor_value_at(const Tensor *t, int row, int col, int row_width);
 static void dequantize_row(const Tensor *t, float *out, int row, int d);
 static void matvec(const Tensor *t, const float *x, float *y, int n, int d, float *dq_row);
@@ -1895,6 +1985,45 @@ static int cache_tensor_f32_inplace(Tensor *t) {
     free(row);
     t->data = buf;
     t->type = 0;
+    return 1;
+}
+
+static int cache_tensor_f16_inplace(Tensor *t) {
+    int n, d, i, j;
+    u16 *buf;
+    float *row;
+    size_t bytes;
+
+    if (!t || t->type == 1) return 1;
+    d = (int)t->dims[0];
+    n = (int)t->dims[1];
+    if (n <= 0 || d <= 0) return 0;
+    bytes = (size_t)n * (size_t)d * sizeof(u16);
+    buf = (u16*)malloc(bytes);
+    row = (float*)malloc((size_t)d * sizeof(float));
+    if (!buf || !row) {
+        free(buf);
+        free(row);
+        return 0;
+    }
+    if (t->type == 0) {
+        const float *src = (const float*)t->data;
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < d; j++) {
+                buf[(size_t)i * (size_t)d + (size_t)j] = fp32_to_fp16(src[(size_t)i * (size_t)d + (size_t)j]);
+            }
+        }
+    } else {
+        for (i = 0; i < n; i++) {
+            dequantize_row(t, row, i, d);
+            for (j = 0; j < d; j++) {
+                buf[(size_t)i * (size_t)d + (size_t)j] = fp32_to_fp16(row[j]);
+            }
+        }
+    }
+    free(row);
+    t->data = buf;
+    t->type = 1;
     return 1;
 }
 
@@ -1991,6 +2120,42 @@ static float *cache_tensor_logical_f32(const Tensor *t, int n, int d) {
     return buf;
 }
 
+static u16 *cache_tensor_logical_f16(const Tensor *t, int n, int d) {
+    int i, j;
+    u16 *buf;
+    float *row;
+    size_t bytes;
+    int raw_n;
+
+    if (!t || n <= 0 || d <= 0) return NULL;
+    if (!((int)t->dims[0] == d && (int)t->dims[1] == n) &&
+        !((int)t->dims[0] == n && (int)t->dims[1] == d)) {
+        return NULL;
+    }
+    bytes = (size_t)n * (size_t)d * sizeof(u16);
+    buf = (u16*)malloc(bytes);
+    raw_n = (int)t->dims[0];
+    if ((int)t->dims[1] > raw_n) raw_n = (int)t->dims[1];
+    row = (float*)malloc((size_t)raw_n * sizeof(float));
+    if (!buf || !row) {
+        free(buf);
+        free(row);
+        return NULL;
+    }
+    if ((int)t->dims[0] == d && (int)t->dims[1] == n) {
+        for (i = 0; i < n; i++) {
+            dequantize_row(t, row, i, d);
+            for (j = 0; j < d; j++) buf[(size_t)i * (size_t)d + (size_t)j] = fp32_to_fp16(row[j]);
+        }
+    } else {
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < d; j++) buf[(size_t)i * (size_t)d + (size_t)j] = fp32_to_fp16(tensor_value_at(t, i, j, d));
+        }
+    }
+    free(row);
+    return buf;
+}
+
 static int cache_tensor_f32_logical_inplace(Tensor *t, int n, int d) {
     float *buf;
     if (!t) return 0;
@@ -2068,6 +2233,11 @@ static size_t tensor_f32_cache_bytes(const Tensor *t) {
     return (size_t)t->dims[0] * (size_t)t->dims[1] * sizeof(float);
 }
 
+static size_t tensor_f16_cache_bytes(const Tensor *t) {
+    if (!t || t->dims[0] == 0 || t->dims[1] == 0) return 0;
+    return (size_t)t->dims[0] * (size_t)t->dims[1] * sizeof(u16);
+}
+
 static int try_cache_tensor_f32_inplace(Tensor *t, size_t *cache_used, size_t cache_budget) {
     size_t bytes;
     if (!t || t->type == 0 || !cache_used) return 0;
@@ -2094,6 +2264,16 @@ static int try_cache_tensor_f32_force_transpose_inplace(Tensor *t, int n, int d,
     bytes = (size_t)n * (size_t)d * sizeof(float);
     if (bytes == 0 || bytes > cache_budget || *cache_used > cache_budget - bytes) return 0;
     if (!cache_tensor_f32_force_transpose_inplace(t, n, d)) return -1;
+    *cache_used += bytes;
+    return 1;
+}
+
+static int try_cache_tensor_f16_inplace(Tensor *t, size_t *cache_used, size_t cache_budget) {
+    size_t bytes;
+    if (!t || t->type == 1 || !cache_used) return 0;
+    bytes = tensor_f16_cache_bytes(t);
+    if (bytes == 0 || bytes > cache_budget || *cache_used > cache_budget - bytes) return 0;
+    if (!cache_tensor_f16_inplace(t)) return -1;
     *cache_used += bytes;
     return 1;
 }
@@ -2176,6 +2356,35 @@ static float fp16_to_fp32(u16 h) {
         f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
     }
     { float fv; memcpy(&fv, &f, 4); return fv; }
+}
+
+static u16 fp32_to_fp16(float fv) {
+    u32 f;
+    u32 sign;
+    int exp;
+    u32 mant;
+    memcpy(&f, &fv, 4);
+    sign = (f >> 16) & 0x8000U;
+    exp = (int)((f >> 23) & 0xFFU) - 127 + 15;
+    mant = f & 0x7FFFFFU;
+    if (exp <= 0) {
+        if (exp < -10) return (u16)sign;
+        mant = (mant | 0x800000U) >> (1 - exp);
+        if (mant & 0x1000U) mant += 0x2000U;
+        return (u16)(sign | (mant >> 13));
+    }
+    if (exp >= 31) {
+        return (u16)(sign | 0x7C00U);
+    }
+    if (mant & 0x1000U) {
+        mant += 0x2000U;
+        if (mant & 0x800000U) {
+            mant = 0;
+            exp++;
+            if (exp >= 31) return (u16)(sign | 0x7C00U);
+        }
+    }
+    return (u16)(sign | ((u32)exp << 10) | (mant >> 13));
 }
 
 #pragma pack(push, 1)
@@ -2632,7 +2841,11 @@ static int default_thread_count(void) {
             }
         }
     }
-    if (n > 8) n = 8;
+    if (is_legacy_windows()) {
+        if (n > 8) n = 8;
+    } else {
+        if (n > MATVEC_POOL_MAX_THREADS) n = MATVEC_POOL_MAX_THREADS;
+    }
     if (n > 0) return n;
 #endif
     return 1;
@@ -3908,6 +4121,42 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     }
 
     if (!legacy_windows &&
+        sizeof(void*) <= 4 &&
+        !m->cached_output &&
+        !m->cached_embd &&
+        m->output == m->tok_embd &&
+        m->tok_embd &&
+        !m->tok_embd_transposed &&
+        m->tok_embd->type != 0) {
+        size_t cache_bytes = (size_t)m->vocab_size * (size_t)m->dim * sizeof(u16);
+        if (cache_bytes <= cache_budget - cache_used) {
+            u16 *buf = cache_tensor_logical_f16(m->tok_embd, m->vocab_size, m->dim);
+            if (buf) {
+                if (!g_clean_output) printf("Caching tied token/output matrix in F16 for faster generation...\n");
+                memset(&m->cached_tok_output_tensor, 0, sizeof(m->cached_tok_output_tensor));
+                strncpy(m->cached_tok_output_tensor.name, m->tok_embd->name, sizeof(m->cached_tok_output_tensor.name) - 1);
+                m->cached_tok_output_tensor.n_dims = 2;
+                m->cached_tok_output_tensor.dims[0] = (u64)m->dim;
+                m->cached_tok_output_tensor.dims[1] = (u64)m->vocab_size;
+                m->cached_tok_output_tensor.type = 1;
+                m->cached_tok_output_tensor.data = buf;
+                m->cached_tok_output_tensor.size_bytes = (u64)cache_bytes;
+                m->cached_tok_output_f16 = buf;
+                m->has_cached_tok_output_tensor = 1;
+                m->tok_embd = &m->cached_tok_output_tensor;
+                m->output = &m->cached_tok_output_tensor;
+                cache_used += cache_bytes;
+            } else if (!g_clean_output) {
+                printf("Skipping F16 tied token/output cache (allocation failed)\n");
+            }
+        } else if (!g_clean_output) {
+            printf("Skipping F16 tied token/output cache (%u MB needed, %u MB budget left)\n",
+                   (unsigned int)(cache_bytes / (1024U * 1024U)),
+                   (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
+        }
+    }
+
+    if (!legacy_windows &&
         !prefer_output_cache &&
         !m->cached_output && m->output && m->output != m->tok_embd &&
         m->output->dims[1] > m->output->dims[0] && m->output->type != 0) {
@@ -3934,15 +4183,58 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
     {
         int l;
         int cached_count = 0;
+        int cached_f16_count = 0;
         int skipped_count = 0;
         int failed_count = 0;
         size_t hot_bytes_needed = 0;
+        size_t hot_cache_budget = cache_budget;
+        size_t runstate_reserve_bytes = 0;
+        int allow_fp16_hot_cache = 0;
         int force_transpose_square_kv =
             (m->arch == ARCH_QWEN2 || m->arch == ARCH_QWEN3 || m->arch == ARCH_QWEN25) &&
             m->attn_q[0] &&
             (int)m->attn_q[0]->dims[0] == m->dim &&
             (int)m->attn_q[0]->dims[1] == m->q_dim &&
             m->q_dim != m->dim;
+
+        if (sizeof(void*) <= 4) {
+            size_t va_budget = 1792U * 1024U * 1024U;
+            size_t kv_size = (size_t)m->n_layers * (size_t)m->n_kv_heads * (size_t)m->max_seq_len * (size_t)m->head_dim;
+            size_t rope_half = (size_t)m->rope_dim / 2U;
+            size_t q_dim_eff = (size_t)(m->q_dim > 0 ? m->q_dim : m->dim);
+            size_t kv_dim_eff = (size_t)(m->kv_dim > 0 ? m->kv_dim : (m->n_kv_heads * m->head_dim));
+            size_t max_d = (size_t)m->dim;
+            if (q_dim_eff > max_d) max_d = q_dim_eff;
+            if (kv_dim_eff > max_d) max_d = kv_dim_eff;
+            if ((size_t)m->hidden_dim > max_d) max_d = (size_t)m->hidden_dim;
+            if ((size_t)m->vocab_size > max_d) max_d = (size_t)m->vocab_size;
+            runstate_reserve_bytes =
+                ((size_t)m->dim +
+                 q_dim_eff * 2U +
+                 kv_dim_eff * 2U +
+                 (size_t)m->hidden_dim * 3U +
+                 (size_t)m->vocab_size +
+                 kv_size * 2U +
+                 (size_t)m->max_seq_len +
+                 max_d) * sizeof(float);
+            if (m->arch != ARCH_GPT2) {
+                runstate_reserve_bytes += (size_t)m->max_seq_len * rope_half * sizeof(float) * 2U;
+                if (m->arch == ARCH_GEMMA3 && m->rope_cos_global && m->rope_sin_global) {
+                    runstate_reserve_bytes += (size_t)m->max_seq_len * rope_half * sizeof(float) * 2U;
+                }
+            }
+            runstate_reserve_bytes += 128U * 1024U * 1024U;
+            {
+                size_t reserve_bytes = ctx->size + runstate_reserve_bytes;
+                if (va_budget > reserve_bytes) {
+                    size_t max_total_cache = va_budget - reserve_bytes;
+                    if (hot_cache_budget > max_total_cache) hot_cache_budget = max_total_cache;
+                } else {
+                    hot_cache_budget = cache_used;
+                }
+            }
+            if (hot_cache_budget < cache_used) hot_cache_budget = cache_used;
+        }
 
         for (l = 0; l < m->n_layers; l++) {
             if (m->attn_q[l] && m->attn_q[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->attn_q[l]);
@@ -3954,40 +4246,37 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
             if (m->ffn_down[l] && m->ffn_down[l]->type != 0) hot_bytes_needed += tensor_f32_cache_bytes(m->ffn_down[l]);
         }
 
-        if (hot_bytes_needed > cache_budget - cache_used) {
-            if (!g_clean_output) {
-                printf("Skipping hot-weight cache (%u MB needed, %u MB budget left)\n",
-                       (unsigned int)(hot_bytes_needed / (1024U * 1024U)),
-                       (unsigned int)((cache_budget - cache_used) / (1024U * 1024U)));
-            }
-            goto hot_cache_done;
-        }
-
         if (!g_clean_output) {
-            printf("Caching hot projection weights in F32 for speed (budget %u MB)...\n",
-                   (unsigned int)(cache_budget / (1024U * 1024U)));
+            if (hot_bytes_needed > hot_cache_budget - cache_used) {
+                printf("Partially caching hot projection weights in F32 for speed (%u MB needed, %u MB budget left)...\n",
+                       (unsigned int)(hot_bytes_needed / (1024U * 1024U)),
+                       (unsigned int)((hot_cache_budget - cache_used) / (1024U * 1024U)));
+            } else {
+                printf("Caching hot projection weights in F32 for speed (budget %u MB)...\n",
+                       (unsigned int)(hot_cache_budget / (1024U * 1024U)));
+            }
         }
         if (force_transpose_square_kv) {
             for (l = 0; l < m->n_layers; l++) {
                 int rc;
                 if (m->attn_q[l] && m->attn_q[l]->type != 0) {
-                    rc = try_cache_tensor_f32_logical_inplace(m->attn_q[l], m->q_dim, m->dim, &cache_used, cache_budget);
+                    rc = try_cache_tensor_f32_logical_inplace(m->attn_q[l], m->q_dim, m->dim, &cache_used, hot_cache_budget);
                     if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_q[l]->name); } else skipped_count++;
                 }
                 if (m->attn_k[l] && m->attn_k[l]->type != 0 &&
                     (int)m->attn_k[l]->dims[0] == m->dim &&
                     (int)m->attn_k[l]->dims[1] == m->dim) {
-                    rc = try_cache_tensor_f32_force_transpose_inplace(m->attn_k[l], m->kv_dim, m->dim, &cache_used, cache_budget);
+                    rc = try_cache_tensor_f32_force_transpose_inplace(m->attn_k[l], m->kv_dim, m->dim, &cache_used, hot_cache_budget);
                     if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_k[l]->name); } else skipped_count++;
                 }
                 if (m->attn_v[l] && m->attn_v[l]->type != 0 &&
                     (int)m->attn_v[l]->dims[0] == m->dim &&
                     (int)m->attn_v[l]->dims[1] == m->dim) {
-                    rc = try_cache_tensor_f32_force_transpose_inplace(m->attn_v[l], m->kv_dim, m->dim, &cache_used, cache_budget);
+                    rc = try_cache_tensor_f32_force_transpose_inplace(m->attn_v[l], m->kv_dim, m->dim, &cache_used, hot_cache_budget);
                     if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_v[l]->name); } else skipped_count++;
                 }
                 if (m->attn_o[l] && m->attn_o[l]->type != 0) {
-                    rc = try_cache_tensor_f32_logical_inplace(m->attn_o[l], m->dim, m->q_dim, &cache_used, cache_budget);
+                    rc = try_cache_tensor_f32_logical_inplace(m->attn_o[l], m->dim, m->q_dim, &cache_used, hot_cache_budget);
                     if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_o[l]->name); } else skipped_count++;
                 }
             }
@@ -3995,44 +4284,78 @@ static int build_model(GGUFContext *ctx, Model *m, HParams *hp, int n_heads_user
         for (l = 0; l < m->n_layers; l++) {
             int rc;
             if (m->attn_q[l] && m->attn_q[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->attn_q[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_q[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->attn_q[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->attn_q[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_q[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->attn_k[l] && m->attn_k[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->attn_k[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_k[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->attn_k[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->attn_k[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_k[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->attn_v[l] && m->attn_v[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->attn_v[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_v[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->attn_v[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->attn_v[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_v[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->attn_o[l] && m->attn_o[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->attn_o[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_o[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->attn_o[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->attn_o[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->attn_o[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->ffn_gate[l] && m->ffn_gate[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->ffn_gate[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_gate[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->ffn_gate[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->ffn_gate[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_gate[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->ffn_up[l] && m->ffn_up[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->ffn_up[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_up[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->ffn_up[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->ffn_up[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_up[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
             if (m->ffn_down[l] && m->ffn_down[l]->type != 0) {
-                rc = try_cache_tensor_f32_inplace(m->ffn_down[l], &cache_used, cache_budget);
-                if (rc > 0) cached_count++; else if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_down[l]->name); } else skipped_count++;
+                rc = try_cache_tensor_f32_inplace(m->ffn_down[l], &cache_used, hot_cache_budget);
+                if (rc == 0 && allow_fp16_hot_cache) {
+                    rc = try_cache_tensor_f16_inplace(m->ffn_down[l], &cache_used, hot_cache_budget);
+                    if (rc > 0) cached_f16_count++;
+                } else if (rc > 0) cached_count++;
+                if (rc < 0) { failed_count++; fprintf(stderr, "Warning: failed to cache %s\n", m->ffn_down[l]->name); }
+                else if (rc == 0) skipped_count++;
             }
         }
         if (!g_clean_output) {
-            printf("Hot weights cache pass complete: cached=%d skipped=%d failed=%d used=%u/%u MB\n",
+            printf("Hot weights cache pass complete: f32=%d f16=%d skipped=%d failed=%d used=%u/%u MB\n",
                    cached_count,
+                   cached_f16_count,
                    skipped_count,
                    failed_count,
                    (unsigned int)(cache_used / (1024U * 1024U)),
-                   (unsigned int)(cache_budget / (1024U * 1024U)));
+                   (unsigned int)(hot_cache_budget / (1024U * 1024U)));
         }
-hot_cache_done:
-        ;
     }
 
     if (!legacy_windows &&
@@ -4097,6 +4420,8 @@ static void free_model(Model *m) {
     if (m->cached_output && m->cached_output != m->cached_embd) { free(m->cached_output); m->cached_output = NULL; }
     if (m->cached_embd) { free(m->cached_embd); m->cached_embd = NULL; }
     if (m->cached_pos_embd) { free(m->cached_pos_embd); m->cached_pos_embd = NULL; }
+    if (m->cached_tok_output_f16) { free(m->cached_tok_output_f16); m->cached_tok_output_f16 = NULL; }
+    m->has_cached_tok_output_tensor = 0;
     if (m->rope_cos)   { free(m->rope_cos);   m->rope_cos = NULL; }
     if (m->rope_sin)   { free(m->rope_sin);   m->rope_sin = NULL; }
     if (m->rope_cos_global) { free(m->rope_cos_global); m->rope_cos_global = NULL; }
@@ -4176,10 +4501,69 @@ static int alloc_runstate(Model *m, RunState *s, GGUFContext *ctx) {
     return 0;
 }
 
+static void reset_runstate(Model *m, RunState *s) {
+    int kv_size;
+    if (!m || !s) return;
+    kv_size = m->n_layers * m->n_kv_heads * m->max_seq_len * m->head_dim;
+    if (s->k_cache) memset(s->k_cache, 0, (size_t)kv_size * sizeof(float));
+    if (s->v_cache) memset(s->v_cache, 0, (size_t)kv_size * sizeof(float));
+}
+
 static void free_runstate(RunState *s) {
     free(s->x); free(s->q); free(s->k); free(s->v); free(s->attn_out);
     free(s->ffn_gate); free(s->ffn_up); free(s->ffn_hidden); free(s->logits); free(s->tmp);
     free(s->k_cache); free(s->v_cache); free(s->attn_scores); free(s->dq_row);
+}
+
+static void attention_streaming_head(const float *q_head, const float *k_base, const float *v_base,
+                                     float *out_head, int head_dim, int t_start, int t_end,
+                                     int max_seq_len, float score_scale, float attn_softcap) {
+    int t, i;
+    float max_score = -1e30f;
+    float denom = 0.0f;
+    for (i = 0; i < head_dim; i++) out_head[i] = 0.0f;
+    for (t = t_start; t <= t_end; t++) {
+        const float *kt = k_base + (size_t)t * (size_t)head_dim;
+        const float *vt = v_base + (size_t)t * (size_t)head_dim;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, score;
+        float prev_scale;
+        float weight;
+        float new_denom;
+        for (i = 0; i + 3 < head_dim; i += 4) {
+            s0 += q_head[i]   * kt[i];
+            s1 += q_head[i+1] * kt[i+1];
+            s2 += q_head[i+2] * kt[i+2];
+            s3 += q_head[i+3] * kt[i+3];
+        }
+        score = (s0 + s1 + s2 + s3);
+        for (; i < head_dim; i++) score += q_head[i] * kt[i];
+        score *= score_scale;
+        if (attn_softcap > 0.0f) score = softcap(score, attn_softcap);
+
+        if (score > max_score) {
+            prev_scale = denom > 0.0f ? fast_exp_table(max_score - score) : 0.0f;
+            weight = 1.0f;
+            new_denom = denom * prev_scale + weight;
+            if (denom > 0.0f) {
+                float keep = (denom * prev_scale) / new_denom;
+                float add = weight / new_denom;
+                for (i = 0; i < head_dim; i++) out_head[i] = out_head[i] * keep + vt[i] * add;
+            } else {
+                for (i = 0; i < head_dim; i++) out_head[i] = vt[i];
+            }
+            denom = new_denom;
+            max_score = score;
+        } else {
+            weight = fast_exp_table(score - max_score);
+            new_denom = denom + weight;
+            if (new_denom > 0.0f) {
+                float keep = denom / new_denom;
+                float add = weight / new_denom;
+                for (i = 0; i < head_dim; i++) out_head[i] = out_head[i] * keep + vt[i] * add;
+            }
+            denom = new_denom;
+        }
+    }
 }
 
 
@@ -4282,40 +4666,11 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
                 float *kc = k_cache + ((l * n_heads + h) * max_seq_len + pos) * head_dim;
                 float *vc = v_cache + ((l * n_heads + h) * max_seq_len + pos) * head_dim;
                 float *out_head = attn_out + h * head_dim;
-                float max_score = -1e30f;
-                float sum_score = 0.0f;
-                for (t2 = 0; t2 <= pos; t2++) {
-                    float *kt = k_cache + ((l * n_heads + h) * max_seq_len + t2) * head_dim;
-                    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, score;
-                    for (i2 = 0; i2 + 3 < head_dim; i2 += 4) {
-                        s0 += q_head[i2]   * kt[i2];
-                        s1 += q_head[i2+1] * kt[i2+1];
-                        s2 += q_head[i2+2] * kt[i2+2];
-                        s3 += q_head[i2+3] * kt[i2+3];
-                    }
-                    score = s0 + s1 + s2 + s3;
-                    for (; i2 < head_dim; i2++) score += q_head[i2] * kt[i2];
-                    score *= m->rsqrt_head_dim;
-                    attn_scores[t2] = score;
-                    if (score > max_score) max_score = score;
-            }
-            for (t2 = 0; t2 <= pos; t2++) {
-                attn_scores[t2] = (float)exp((double)(attn_scores[t2] - max_score));
-                sum_score += attn_scores[t2];
-            }
-                for (t2 = 0; t2 <= pos; t2++) attn_scores[t2] /= sum_score;
-                for (i2 = 0; i2 < head_dim; i2++) out_head[i2] = 0.0f;
-                for (t2 = 0; t2 <= pos; t2++) {
-                    float score = attn_scores[t2];
-                    float *vt = v_cache + ((l * n_heads + h) * max_seq_len + t2) * head_dim;
-                    for (i2 = 0; i2 + 3 < head_dim; i2 += 4) {
-                        out_head[i2]   += score * vt[i2];
-                        out_head[i2+1] += score * vt[i2+1];
-                        out_head[i2+2] += score * vt[i2+2];
-                        out_head[i2+3] += score * vt[i2+3];
-                    }
-                    for (; i2 < head_dim; i2++) out_head[i2] += score * vt[i2];
-                }
+                attention_streaming_head(q_head,
+                                         k_cache + ((l * n_heads + h) * max_seq_len) * head_dim,
+                                         v_cache + ((l * n_heads + h) * max_seq_len) * head_dim,
+                                         out_head, head_dim, 0, pos, max_seq_len,
+                                         m->rsqrt_head_dim, 0.0f);
                 for (i2 = 0; i2 < head_dim; i2++) {
                     kc[i2] = k_head[i2];
                     vc[i2] = v_head[i2];
@@ -4439,44 +4794,14 @@ static int forward(Model *m, RunState *s, int token, int pos, float temp, int to
         }
 
         for (h = 0; h < n_heads; h++) {
-            float max_score = -1e30f;
-            float sum_score = 0.0f;
             float *q_head = q + h * head_dim;
             float *out_head = attn_out + h * head_dim;
             h_kv = h / q_per_kv;
-            for (t = attn_start; t <= pos; t++) {
-                float *kt = k_cache + ((l * n_kv_heads + h_kv) * max_seq_len + t) * head_dim;
-                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, score;
-                for (i = 0; i + 3 < head_dim; i += 4) {
-                    s0 += q_head[i]   * kt[i];
-                    s1 += q_head[i+1] * kt[i+1];
-                    s2 += q_head[i+2] * kt[i+2];
-                    s3 += q_head[i+3] * kt[i+3];
-                }
-                score = s0 + s1 + s2 + s3;
-                for (; i < head_dim; i++) score += q_head[i] * kt[i];
-                score *= m->rsqrt_head_dim;
-                if (attn_softcap > 0.0f) score = softcap(score, attn_softcap);
-                attn_scores[t] = score;
-                if (score > max_score) max_score = score;
-            }
-            for (t = attn_start; t <= pos; t++) {
-                attn_scores[t] = (float)exp((double)(attn_scores[t] - max_score));
-                sum_score += attn_scores[t];
-            }
-            for (t = attn_start; t <= pos; t++) attn_scores[t] /= sum_score;
-            for (i = 0; i < head_dim; i++) out_head[i] = 0.0f;
-            for (t = attn_start; t <= pos; t++) {
-                float *vt = v_cache + ((l * n_kv_heads + h_kv) * max_seq_len + t) * head_dim;
-                float score = attn_scores[t];
-                for (i = 0; i + 3 < head_dim; i += 4) {
-                    out_head[i]   += score * vt[i];
-                    out_head[i+1] += score * vt[i+1];
-                    out_head[i+2] += score * vt[i+2];
-                    out_head[i+3] += score * vt[i+3];
-                }
-                for (; i < head_dim; i++) out_head[i] += score * vt[i];
-            }
+            attention_streaming_head(q_head,
+                                     k_cache + ((l * n_kv_heads + h_kv) * max_seq_len) * head_dim,
+                                     v_cache + ((l * n_kv_heads + h_kv) * max_seq_len) * head_dim,
+                                     out_head, head_dim, attn_start, pos, max_seq_len,
+                                     m->rsqrt_head_dim, attn_softcap);
         }
         matvec(m->attn_o[l], attn_out, x, dim, q_dim, s->dq_row);
         if (is_gemma_family && m->post_attn_norm[l] && m->post_attn_norm[l]->data) {
@@ -4779,6 +5104,113 @@ static int append_sentencepiece_text_tokens(int *dst, int cap, int n, const char
     return n;
 }
 
+static int build_llama3_prefix_text(char *dst, size_t cap, const char *system_prompt) {
+    if (!dst || cap == 0) return -1;
+    if (!system_prompt) system_prompt = "";
+    return _snprintf(dst, cap,
+                     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+                     "Cutting Knowledge Date: December 2023\n"
+                     "Today Date: 26 Jul 2024\n\n"
+                     "%s<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n",
+                     system_prompt);
+}
+
+static void free_prompt_prefix_cache(PromptPrefixCache *cache) {
+    if (!cache) return;
+    free(cache->k_cache);
+    free(cache->v_cache);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static int apply_prompt_prefix_cache(Model *m, RunState *s, const PromptPrefixCache *cache) {
+    int l, h;
+    int prefix_tokens;
+    size_t copied_floats = 0;
+    if (!m || !s || !cache || !cache->valid || !cache->k_cache || !cache->v_cache) return 0;
+    prefix_tokens = cache->prefix_tokens;
+    if (prefix_tokens <= 0 || prefix_tokens > cache->prefix_capacity_tokens || prefix_tokens > m->max_seq_len) return 0;
+    for (l = 0; l < m->n_layers; l++) {
+        for (h = 0; h < m->n_kv_heads; h++) {
+            size_t compact_off = copied_floats;
+            size_t run_off = (((size_t)l * (size_t)m->n_kv_heads) + (size_t)h) * (size_t)m->max_seq_len * (size_t)m->head_dim;
+            size_t copy_floats = (size_t)prefix_tokens * (size_t)m->head_dim;
+            memcpy(s->k_cache + run_off, cache->k_cache + compact_off, copy_floats * sizeof(float));
+            memcpy(s->v_cache + run_off, cache->v_cache + compact_off, copy_floats * sizeof(float));
+            copied_floats += copy_floats;
+        }
+    }
+    return prefix_tokens;
+}
+
+static int build_llama3_prefix_cache(Model *m, GGUFContext *ctx, const char *system_prompt, PromptPrefixCache *cache) {
+    RunState s;
+    int *prefix_tokens = NULL;
+    int prefix_len;
+    int pos;
+    int l, h;
+    size_t total_prefix_floats;
+    size_t copied_floats = 0;
+    char *prefix_buf;
+    size_t prefix_cap;
+
+    if (!m || !ctx || !cache) return 0;
+    memset(cache, 0, sizeof(*cache));
+    if (!system_prompt) system_prompt = "";
+    prefix_cap = strlen(system_prompt) + 256;
+    prefix_buf = (char*)malloc(prefix_cap);
+    if (!prefix_buf) return 0;
+    if (build_llama3_prefix_text(prefix_buf, prefix_cap, system_prompt) < 0) {
+        free(prefix_buf);
+        return 0;
+    }
+    prefix_tokens = (int*)malloc((size_t)m->max_seq_len * sizeof(int));
+    if (!prefix_tokens) {
+        free(prefix_buf);
+        return 0;
+    }
+    prefix_len = tokenize(prefix_buf, prefix_tokens, m->max_seq_len, m->vocab_size);
+    free(prefix_buf);
+    if (prefix_len <= 0 || prefix_len >= m->max_seq_len) {
+        free(prefix_tokens);
+        return 0;
+    }
+    memset(&s, 0, sizeof(s));
+    if (alloc_runstate(m, &s, ctx) != 0) {
+        free(prefix_tokens);
+        free_runstate(&s);
+        return 0;
+    }
+    for (pos = 0; pos < prefix_len; pos++) {
+        forward(m, &s, prefix_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
+    }
+
+    total_prefix_floats = (size_t)m->n_layers * (size_t)m->n_kv_heads * (size_t)prefix_len * (size_t)m->head_dim;
+    cache->k_cache = (float*)malloc(total_prefix_floats * sizeof(float));
+    cache->v_cache = (float*)malloc(total_prefix_floats * sizeof(float));
+    if (!cache->k_cache || !cache->v_cache) {
+        free_prompt_prefix_cache(cache);
+        free(prefix_tokens);
+        free_runstate(&s);
+        return 0;
+    }
+    for (l = 0; l < m->n_layers; l++) {
+        for (h = 0; h < m->n_kv_heads; h++) {
+            size_t compact_off = copied_floats;
+            size_t run_off = (((size_t)l * (size_t)m->n_kv_heads) + (size_t)h) * (size_t)m->max_seq_len * (size_t)m->head_dim;
+            size_t copy_floats = (size_t)prefix_len * (size_t)m->head_dim;
+            memcpy(cache->k_cache + compact_off, s.k_cache + run_off, copy_floats * sizeof(float));
+            memcpy(cache->v_cache + compact_off, s.v_cache + run_off, copy_floats * sizeof(float));
+            copied_floats += copy_floats;
+        }
+    }
+    cache->prefix_tokens = prefix_len;
+    cache->prefix_capacity_tokens = prefix_len;
+    cache->valid = 1;
+    free(prefix_tokens);
+    free_runstate(&s);
+    return 1;
+}
+
 static void print_token_text_clean(const char *text, int len) {
     int i = 0;
     while (i < len) {
@@ -4958,6 +5390,7 @@ static void sanitize_repl_input(char *s) {
     }
     p[j] = '\0';
 }
+
 
 static void path_stem(const char *path, char *out, size_t out_cap) {
     const char *base = path;
@@ -5423,9 +5856,13 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
                              int n_generate, float temp, int top_k, float top_p, float min_p,
                              int eos_token, int no_eos_stop, int do_chat, int do_raw_tokens,
                              int gpt2_instruct_mode, int smollm2_mode, int qwen_chatml_mode,
-                             int tinyllama_mode, int gemma3_mode, int slopllm_mode,
+                             int tinyllama_mode, int gemma3_mode, int llama3_chat_mode,
+                             int slopllm_mode, const char *system_prompt,
+                             const PromptPrefixCache *prefix_cache,
+                             RunState *shared_state,
                              int interactive_mode, int n_generate_user) {
-    RunState s;
+    RunState s_local;
+    RunState *s;
     int prompt_len = 0;
     int *prompt_tokens;
     int next_token = 0;
@@ -5434,6 +5871,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
     int pos;
     int i;
     int tokens_printed = 0;
+    int prefix_cache_tokens = 0;
     double t_request_start;
     double t_first_token = 0.0;
     double t_end;
@@ -5444,16 +5882,21 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
     if (max_generate < 1) max_generate = 1;
     stop_on_eos = interactive_mode && !no_eos_stop;
     g_allow_eog_sampling = stop_on_eos ? 1 : 0;
-    memset(&s, 0, sizeof(s));
-    if (alloc_runstate(m, &s, ctx) != 0) {
-        g_allow_eog_sampling = 0;
-        return 1;
+    s = shared_state ? shared_state : &s_local;
+    if (shared_state) {
+        reset_runstate(m, s);
+    } else {
+        memset(&s_local, 0, sizeof(s_local));
+        if (alloc_runstate(m, s, ctx) != 0) {
+            g_allow_eog_sampling = 0;
+            return 1;
+        }
     }
 
     prompt_tokens = (int*)malloc(m->max_seq_len * sizeof(int));
     if (!prompt_tokens) {
         fprintf(stderr, "Failed to allocate prompt buffer\n");
-        free_runstate(&s);
+        if (!shared_state) free_runstate(s);
         g_allow_eog_sampling = 0;
         return 1;
     }
@@ -5471,6 +5914,9 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
         if (auto_bos_id < 0) auto_bos_id = tok_bos;
         if (auto_bos_id < 0) auto_bos_id = tok_endoftext;
         int prompt_has_template =
+            contains_nocase(prompt, "<|begin_of_text|>") ||
+            contains_nocase(prompt, "<|start_header_id|>") ||
+            contains_nocase(prompt, "<|eot_id|>") ||
             contains_nocase(prompt, "<start_of_turn>") ||
             contains_nocase(prompt, "<|im_start|>") ||
             contains_nocase(prompt, "<|user|>") ||
@@ -5500,7 +5946,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
             n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "\n", m->vocab_size);
             if (tok_im_start >= 0 && n < m->max_seq_len) prompt_tokens[n++] = tok_im_start;
             n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "assistant\n", m->vocab_size);
-        } else if (m->arch == ARCH_GPT2 || (!do_chat && !smollm2_mode && !qwen_chatml_mode && !tinyllama_mode && !gemma3_mode && !slopllm_mode)) {
+        } else if (m->arch == ARCH_GPT2 || (!do_chat && !smollm2_mode && !qwen_chatml_mode && !tinyllama_mode && !gemma3_mode && !llama3_chat_mode && !slopllm_mode)) {
             prompt_len = tokenize(prompt, prompt_tokens, m->max_seq_len, m->vocab_size);
         } else if (smollm2_mode) {
             char *chat_buf;
@@ -5512,7 +5958,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
             if (!chat_buf) {
                 fprintf(stderr, "Failed to allocate SmolLM2 prompt buffer\n");
                 free(prompt_tokens);
-                free_runstate(&s);
+                if (!shared_state) free_runstate(s);
                 g_allow_eog_sampling = 0;
                 return 1;
             }
@@ -5536,6 +5982,47 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
             n = append_sentencepiece_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
             n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<end_of_turn>\n", m->vocab_size);
             n = append_text_tokens(prompt_tokens, m->max_seq_len, n, "<start_of_turn>model\n", m->vocab_size);
+        } else if (llama3_chat_mode) {
+            wrapped_prompt = 1;
+            if (!g_clean_output) printf("Chat tokens: llama3 header-id style\n");
+            if (prefix_cache && prefix_cache->valid) {
+                prefix_cache_tokens = apply_prompt_prefix_cache(m, s, prefix_cache);
+                if (prefix_cache_tokens > 0 && !g_clean_output) {
+                    printf("Reusing cached llama3 prefix (%d tokens)\n", prefix_cache_tokens);
+                }
+                n = append_text_tokens(prompt_tokens, m->max_seq_len, n, prompt, m->vocab_size);
+                n = append_text_tokens(prompt_tokens, m->max_seq_len, n,
+                                       "<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
+                                       m->vocab_size);
+            } else {
+                char *chat_buf;
+                size_t system_len;
+                size_t prompt_len_bytes;
+                size_t chat_cap;
+                if (!system_prompt) system_prompt = "";
+                system_len = strlen(system_prompt);
+                prompt_len_bytes = strlen(prompt);
+                chat_cap = system_len + prompt_len_bytes + 512;
+                chat_buf = (char*)malloc(chat_cap);
+                if (!chat_buf) {
+                    fprintf(stderr, "Failed to allocate Llama 3 prompt buffer\n");
+                    free(prompt_tokens);
+                    if (!shared_state) free_runstate(s);
+                    g_allow_eog_sampling = 0;
+                    return 1;
+                }
+                sprintf(chat_buf,
+                        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+                        "Cutting Knowledge Date: December 2023\n"
+                        "Today Date: 26 Jul 2024\n\n"
+                        "%s<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+                        "%s<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
+                        system_prompt,
+                        prompt);
+                prompt_len = tokenize(chat_buf, prompt_tokens, m->max_seq_len, m->vocab_size);
+                free(chat_buf);
+                n = prompt_len;
+            }
         } else if (tinyllama_mode) {
             wrapped_prompt = 1;
             if (!g_clean_output) printf("Chat tokens: tinyllama Llama-2 style\n");
@@ -5585,7 +6072,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
     if (prompt_len < 0) {
         fprintf(stderr, "Failed to tokenize prompt\n");
         free(prompt_tokens);
-        free_runstate(&s);
+        if (!shared_state) free_runstate(s);
         g_allow_eog_sampling = 0;
         return 1;
     }
@@ -5608,12 +6095,13 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
 
     t_request_start = now_seconds();
     if (prompt_len > 1 && !g_clean_output) {
-        printf("Prefill %d tokens...", prompt_len);
+        printf("Prefill %d tokens...", prompt_len + prefix_cache_tokens);
         fflush(stdout);
     }
-    for (pos = 0; pos < prompt_len - 1 && prompt_len > 0; pos++) {
-        forward(m, &s, prompt_tokens[pos], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
-        if (prompt_len > 1 && !g_clean_output && (pos % 2 == 1 || pos == prompt_len - 2)) {
+    pos = prefix_cache_tokens;
+    for (i = 0; i < prompt_len - 1 && prompt_len > 0; i++, pos++) {
+        forward(m, s, prompt_tokens[i], pos, 0.0f, 0, 0.0f, 0.0f, NULL, 0, -1, 0);
+        if (prompt_len > 1 && !g_clean_output && (i % 2 == 1 || i == prompt_len - 2)) {
             printf(".");
             fflush(stdout);
         }
@@ -5622,12 +6110,12 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
     if (prompt_len > 1 && !g_clean_output) printf("\n");
     if (prompt_len > 0) {
         int ban_token = (!interactive_mode && !no_eos_stop && max_generate > 1) ? eos_token : -1;
-        next_token = forward(m, &s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
-        pos = prompt_len;
+        next_token = forward(m, s, prompt_tokens[prompt_len - 1], pos, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
+        pos++;
     } else {
         int ban_token = (!interactive_mode && !no_eos_stop && max_generate > 1) ? eos_token : -1;
-        next_token = forward(m, &s, 1, 0, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
-        pos = 1;
+        next_token = forward(m, s, 1, pos, temp, top_k, top_p, min_p, NULL, 0, ban_token, 1);
+        pos++;
     }
 
     {
@@ -5636,7 +6124,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
         if (!last_tokens) {
             fprintf(stderr, "Failed to allocate repetition buffer\n");
             free(prompt_tokens);
-            free_runstate(&s);
+            if (!shared_state) free_runstate(s);
             g_allow_eog_sampling = 0;
             return 1;
         }
@@ -5656,7 +6144,7 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
         for (i = 1; i < max_generate; i++) {
             int ban_token = (!interactive_mode && !no_eos_stop && i + 1 < max_generate) ? eos_token : -1;
             if (pos >= m->max_seq_len) break;
-            next_token = forward(m, &s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, ban_token, 1);
+            next_token = forward(m, s, next_token, pos, temp, top_k, top_p, min_p, last_tokens, n_last, ban_token, 1);
             pos++;
             if (stop_on_eos && is_eog_token(next_token, eos_token)) break;
             if (do_raw_tokens) {
@@ -5683,14 +6171,14 @@ static int run_local_request(Model *m, GGUFContext *ctx, HParams *hp,
             int gen_tokens = tokens_printed > 1 ? (tokens_printed - 1) : 0;
             if (gen_tokens > 0 && gen_s > 0.0) tps = (double)gen_tokens / gen_s;
             printf("Stats: TTFT=%.3fs, TPS=%.2f tok/s, output=%d tokens, prompt=%d tokens, total=%.3fs\n",
-                   ttft_s, tps, tokens_printed, prompt_len, t_end - t_request_start);
+                   ttft_s, tps, tokens_printed, prompt_len + prefix_cache_tokens, t_end - t_request_start);
         } else {
             printf("Stats: no tokens produced, total=%.3fs\n", t_end - t_request_start);
         }
     }
 
     free(prompt_tokens);
-    free_runstate(&s);
+    if (!shared_state) free_runstate(s);
     g_allow_eog_sampling = 0;
     return 0;
 }
@@ -5701,6 +6189,7 @@ int main(int argc, char **argv) {
     GGUFContext *ctx;
     Model m;
     HParams hp;
+    PromptPrefixCache prefix_cache;
     Arch parsed_arch;
     char *model_path = NULL;
     char *tok_path = NULL;
@@ -5710,6 +6199,7 @@ int main(int argc, char **argv) {
     char *api_model = NULL;
     char *api_key = NULL;
     char *api_system = NULL;
+    char *chat_system = NULL;
     int n_generate = 64;
     float temp = 0.8f;
     float top_p = 0.95f;
@@ -5726,6 +6216,7 @@ int main(int argc, char **argv) {
     int do_interactive = 0;
     int tinyllama_mode = 0;
     int gemma3_mode = 0;
+    int llama3_chat_mode = 0;
     int gpt2_instruct_mode = 0;
     int smollm2_mode = 0;
     int qwen_chatml_mode = 0;
@@ -5759,6 +6250,7 @@ int main(int argc, char **argv) {
         printf("  --api-model <m> API model name (default OPENAI_MODEL or model file stem)\n");
         printf("  --api-key <k>   API key (default OPENAI_API_KEY)\n");
         printf("  --api-system <s> System prompt for API mode\n");
+        printf("  --system <s>    System prompt for local chat templates\n");
         printf("  -f <file>       Read prompt from file\n");
         printf("  -n <num>        Max tokens to generate (default 64)\n");
         printf("  -t <temp>       Temperature, 0=argmax (default 0.8)\n");
@@ -5782,6 +6274,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     memset(&m, 0, sizeof(Model));
+    memset(&prefix_cache, 0, sizeof(prefix_cache));
     m.repeat_penalty = 1.0f;
     reset_byte_token_map();
 
@@ -5800,6 +6293,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[arg], "--api-model") == 0 && arg + 1 < argc) { api_model = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--api-key") == 0 && arg + 1 < argc) { api_key = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--api-system") == 0 && arg + 1 < argc) { api_system = argv[arg+1]; arg++; }
+        else if (strcmp(argv[arg], "--system") == 0 && arg + 1 < argc) { chat_system = argv[arg+1]; arg++; }
         else if (strcmp(argv[arg], "--threads") == 0 && arg + 1 < argc) {
             if (strcmp(argv[arg+1], "auto") == 0 || strcmp(argv[arg+1], "AUTO") == 0) g_n_threads = 0;
             else g_n_threads = atoi(argv[arg+1]);
@@ -5911,6 +6405,9 @@ int main(int argc, char **argv) {
                      parsed_arch == ARCH_QWEN3 ||
                      parsed_arch == ARCH_QWEN25 ||
                      contains_nocase(hp.tokenizer_pre, "qwen"));
+    llama3_chat_mode = template_mentions(&hp, "<|start_header_id|>") ||
+                       template_mentions(&hp, "<|eot_id|>") ||
+                       template_mentions(&hp, "begin_of_text");
     qwen_chatml_mode = (parsed_arch == ARCH_QWEN2 ||
                         parsed_arch == ARCH_QWEN3 ||
                         parsed_arch == ARCH_QWEN25 ||
@@ -5933,14 +6430,38 @@ int main(int argc, char **argv) {
         int est_dim = (int)hp.embedding_length;
         int est_layers = (int)hp.block_count;
         int est_hidden = (int)hp.feed_forward_length;
+        int est_heads = (int)hp.attention_head_count;
+        int est_kv_heads = (int)hp.attention_head_count_kv;
+        int est_head_dim = (int)hp.attention_key_length;
         int est_seq = seq_user ? seq_user : ((int)hp.context_length ? (int)hp.context_length : 512);
+        int est_safe_seq;
         unsigned int file_mb = (unsigned int)(ctx->size / (1024*1024));
-        unsigned int cache_kb = (unsigned int)((u64)est_layers * (2 * est_dim * est_dim + est_dim * est_hidden) * 4 / 1024);
-        unsigned int state_kb = (unsigned int)((u64)est_seq * est_dim * 2 * 4 / 1024);
+        unsigned int hot_cache_mb;
+        unsigned int state_kb;
+        unsigned int total_min_mb;
+
+        if (est_heads <= 0) est_heads = 1;
+        if (est_head_dim <= 0 && est_dim > 0 && est_heads > 0) est_head_dim = est_dim / est_heads;
+        if (est_kv_heads <= 0) est_kv_heads = est_heads;
+        if (est_head_dim <= 0) est_head_dim = est_dim > 0 ? est_dim : 1;
+        est_safe_seq = effective_seq_limit(est_seq, est_layers > 0 ? est_layers : 1,
+                                           est_kv_heads > 0 ? est_kv_heads : 1,
+                                           est_head_dim > 0 ? est_head_dim : 1);
+        hot_cache_mb = (unsigned int)((u64)est_layers * (2 * est_dim * est_dim + est_dim * est_hidden) * 4 / (1024U * 1024U));
+        state_kb = (unsigned int)(((u64)est_dim +
+                                   (u64)est_dim * 2U +
+                                   (u64)est_kv_heads * (u64)est_head_dim * 2U +
+                                   (u64)est_hidden * 3U +
+                                   (u64)est_dim +
+                                   (u64)est_layers * (u64)est_kv_heads * (u64)est_safe_seq * (u64)est_head_dim * 2U +
+                                   (u64)est_safe_seq +
+                                   (u64)est_hidden) * 4U / 1024U);
+        total_min_mb = file_mb + state_kb / 1024U;
         if (!g_clean_output) {
-            printf("Estimated memory: file=%uMB + matmul_workspace=%uKB + run_state=%uKB\n",
-                   file_mb, cache_kb, state_kb);
-            printf("Total RAM needed: ~%u MB\n", file_mb + cache_kb/1024 + state_kb/1024);
+            printf("Estimated memory: file=%uMB + runtime_state=%uKB (seq=%d)\n",
+                   file_mb, state_kb, est_safe_seq);
+            printf("Minimum RAM for this run: ~%u MB\n", total_min_mb);
+            printf("Optional hot-weight cache for speed: ~%u MB\n", hot_cache_mb);
         }
     }
 
@@ -5970,6 +6491,16 @@ int main(int argc, char **argv) {
         if (tok_eos >= 0) eos_token = tok_eos;
     }
 
+    if (do_repl && llama3_chat_mode) {
+        if (build_llama3_prefix_cache(&m, ctx, chat_system, &prefix_cache)) {
+            if (!g_clean_output) {
+                printf("Cached llama3 chat prefix for reuse (%d tokens)\n", prefix_cache.prefix_tokens);
+            }
+        } else if (!g_clean_output) {
+            printf("Warning: failed to build llama3 prefix cache; falling back to full prefill per request\n");
+        }
+    }
+
     if (do_repl) {
         char repl_buf[8192];
         char file_buf[8192];
@@ -5985,8 +6516,10 @@ int main(int argc, char **argv) {
                 if (run_local_request(&m, ctx, &hp, model_path, file_buf, n_generate, temp, top_k, top_p, min_p,
                                       eos_token, no_eos_stop, do_chat, do_raw_tokens,
                                       gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
-                                      tinyllama_mode, gemma3_mode, slopllm_mode,
+                                      tinyllama_mode, gemma3_mode, llama3_chat_mode, slopllm_mode, chat_system, &prefix_cache,
+                                      NULL,
                                       do_interactive, n_generate_user) != 0) {
+                    free_prompt_prefix_cache(&prefix_cache);
                     free_model(&m);
                     gguf_free(ctx);
                     if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
@@ -5998,8 +6531,10 @@ int main(int argc, char **argv) {
             if (run_local_request(&m, ctx, &hp, model_path, prompt, n_generate, temp, top_k, top_p, min_p,
                                   eos_token, no_eos_stop, do_chat, do_raw_tokens,
                                   gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
-                                  tinyllama_mode, gemma3_mode, slopllm_mode,
+                                  tinyllama_mode, gemma3_mode, llama3_chat_mode, slopllm_mode, chat_system, &prefix_cache,
+                                  NULL,
                                   do_interactive, n_generate_user) != 0) {
+                free_prompt_prefix_cache(&prefix_cache);
                 free_model(&m);
                 gguf_free(ctx);
                 if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
@@ -6021,14 +6556,16 @@ int main(int argc, char **argv) {
             if (run_local_request(&m, ctx, &hp, model_path, repl_buf, n_generate, temp, top_k, top_p, min_p,
                                   eos_token, no_eos_stop, do_chat, do_raw_tokens,
                                   gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
-                                  tinyllama_mode, gemma3_mode, slopllm_mode,
+                                  tinyllama_mode, gemma3_mode, llama3_chat_mode, slopllm_mode, chat_system, &prefix_cache,
+                                  NULL,
                                   do_interactive, n_generate_user) != 0) {
-                free_model(&m);
-                gguf_free(ctx);
-                if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
-                if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
-                return 1;
-            }
+                    free_prompt_prefix_cache(&prefix_cache);
+                    free_model(&m);
+                    gguf_free(ctx);
+                    if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
+                    if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
+                    return 1;
+                }
         }
     } else {
         char file_buf[8192];
@@ -6039,8 +6576,10 @@ int main(int argc, char **argv) {
         if (run_local_request(&m, ctx, &hp, model_path, request_prompt, n_generate, temp, top_k, top_p, min_p,
                               eos_token, no_eos_stop, do_chat, do_raw_tokens,
                               gpt2_instruct_mode, smollm2_mode, qwen_chatml_mode,
-                              tinyllama_mode, gemma3_mode, slopllm_mode,
+                              tinyllama_mode, gemma3_mode, llama3_chat_mode, slopllm_mode, chat_system, NULL,
+                              NULL,
                               0, n_generate_user) != 0) {
+            free_prompt_prefix_cache(&prefix_cache);
             free_model(&m);
             gguf_free(ctx);
             if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
@@ -6049,10 +6588,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    free_prompt_prefix_cache(&prefix_cache);
     free_model(&m);
     gguf_free(ctx);
     if (g_tok_buf) { free(g_tok_buf); free(g_vocab); }
     if (g_sorted_vocab) { free(g_sorted_vocab); g_sorted_vocab = NULL; g_sorted_init = 0; }
     return 0;
 }
-
